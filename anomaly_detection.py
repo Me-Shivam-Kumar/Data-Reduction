@@ -1,9 +1,8 @@
 """
-Anomaly Detection and Isolation Module for the Data Warehouse Subsampling Framework.
+Anomaly Detection and Isolation module for the Data Warehouse Subsampling Framework.
 
-This module implements the second layer of the data subsampling architecture,
-responsible for identifying and extracting anomalies with contextual metadata
-and storing them separately for preservation during the sampling process.
+This module provides components for detecting and isolating anomalies
+in the data, ensuring they are preserved for testing purposes.
 """
 
 import os
@@ -11,332 +10,42 @@ import logging
 import pandas as pd
 import numpy as np
 from typing import Any, Dict, List, Optional, Union, Tuple
-from dataclasses import dataclass
 import json
-from datetime import datetime
-import pickle
-from sklearn.ensemble import IsolationForest
-from sklearn.svm import OneClassSVM
-from sklearn.neighbors import LocalOutlierFactor
-from sklearn.preprocessing import StandardScaler
-import pymongo
+from collections import defaultdict
+from scipy import stats
 
-from ..common.base import Component, ConfigManager, PipelineStep, Pipeline, ProcessingError, ValidationError
-from ..common.utils import validate_data_frame
-from ..common.connectors import create_connector
+from ..common.base import Component, ConfigManager, Pipeline, PipelineStep, ProcessingError
+from ..common.utils import save_dataframe, load_dataframe, save_json, load_json, ensure_directory
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class Anomaly:
-    """Representation of a data anomaly."""
-    id: str
-    table_name: str
-    domain: str
-    detection_method: str
-    detection_score: float
-    original_row: Dict[str, Any]
-    context: Dict[str, Any]
-    related_anomalies: List[str] = None
-    created_at: datetime = None
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert the anomaly to a dictionary.
-        
-        Returns:
-            Dictionary representation of the anomaly.
-        """
-        return {
-            'id': self.id,
-            'table_name': self.table_name,
-            'domain': self.domain,
-            'detection_method': self.detection_method,
-            'detection_score': self.detection_score,
-            'original_row': self.original_row,
-            'context': self.context,
-            'related_anomalies': self.related_anomalies,
-            'created_at': self.created_at.isoformat() if self.created_at else None
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'Anomaly':
-        """Create an Anomaly from a dictionary.
-        
-        Args:
-            data: Dictionary with anomaly information.
-        
-        Returns:
-            Anomaly instance.
-        """
-        created_at = None
-        if data.get('created_at'):
-            try:
-                created_at = datetime.fromisoformat(data['created_at'])
-            except (ValueError, TypeError):
-                created_at = None
-        
-        return cls(
-            id=data.get('id', ''),
-            table_name=data.get('table_name', ''),
-            domain=data.get('domain', ''),
-            detection_method=data.get('detection_method', ''),
-            detection_score=data.get('detection_score', 0.0),
-            original_row=data.get('original_row', {}),
-            context=data.get('context', {}),
-            related_anomalies=data.get('related_anomalies', []),
-            created_at=created_at
-        )
-
-
-class AnomalyRepository(Component):
-    """Repository for storing and retrieving anomalies."""
+class AnomalyDetector(Component):
+    """Base class for anomaly detectors."""
     
     def __init__(self, config_manager: ConfigManager):
-        """Initialize the anomaly repository.
+        """Initialize the anomaly detector.
         
         Args:
             config_manager: Configuration manager instance.
         """
         super().__init__(config_manager)
-        self.repository_type = None
-        self.connection = None
-        self.file_path = None
-        self.mongo_client = None
-        self.mongo_db = None
-        self.mongo_collection = None
     
-    def initialize(self) -> None:
-        """Initialize the anomaly repository.
-        
-        Raises:
-            ConfigurationError: If the repository cannot be initialized.
-        """
-        # Get repository configuration
-        repo_config = self.config_manager.get('anomaly_detection.anomaly_repository', {})
-        self.repository_type = repo_config.get('type', 'file')
-        
-        if self.repository_type == 'file':
-            # Create output directory
-            output_dir = os.path.join(
-                self.config_manager.get('general.output_directory', '/output/dwsf'),
-                'anomaly_detection',
-                'repository'
-            )
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Set file path
-            self.file_path = os.path.join(output_dir, 'anomalies.json')
-            
-            self.logger.info(f"Anomaly repository initialized with file storage at {self.file_path}")
-        
-        elif self.repository_type == 'mongodb':
-            # Get MongoDB connection parameters
-            mongo_config = repo_config.get('connection', {})
-            
-            try:
-                # Connect to MongoDB
-                host = mongo_config.get('host', 'localhost')
-                port = mongo_config.get('port', 27017)
-                database = mongo_config.get('database', 'anomaly_repository')
-                collection = mongo_config.get('collection', 'anomalies')
-                user = mongo_config.get('user', '')
-                password = mongo_config.get('password', '')
-                
-                # Build connection string
-                if user and password:
-                    connection_string = f"mongodb://{user}:{password}@{host}:{port}/{database}"
-                else:
-                    connection_string = f"mongodb://{host}:{port}/{database}"
-                
-                # Connect to MongoDB
-                self.mongo_client = pymongo.MongoClient(connection_string)
-                self.mongo_db = self.mongo_client[database]
-                self.mongo_collection = self.mongo_db[collection]
-                
-                # Create indexes
-                self.mongo_collection.create_index('id', unique=True)
-                self.mongo_collection.create_index('table_name')
-                self.mongo_collection.create_index('domain')
-                self.mongo_collection.create_index('detection_method')
-                
-                self.logger.info(f"Anomaly repository initialized with MongoDB storage at {host}:{port}/{database}/{collection}")
-            except Exception as e:
-                self.logger.error(f"Error initializing MongoDB connection: {str(e)}")
-                # Fall back to file storage
-                self.repository_type = 'file'
-                output_dir = os.path.join(
-                    self.config_manager.get('general.output_directory', '/output/dwsf'),
-                    'anomaly_detection',
-                    'repository'
-                )
-                os.makedirs(output_dir, exist_ok=True)
-                self.file_path = os.path.join(output_dir, 'anomalies.json')
-                self.logger.info(f"Falling back to file storage at {self.file_path}")
-        
-        else:
-            # Unsupported repository type, fall back to file
-            self.repository_type = 'file'
-            output_dir = os.path.join(
-                self.config_manager.get('general.output_directory', '/output/dwsf'),
-                'anomaly_detection',
-                'repository'
-            )
-            os.makedirs(output_dir, exist_ok=True)
-            self.file_path = os.path.join(output_dir, 'anomalies.json')
-            self.logger.info(f"Unsupported repository type '{self.repository_type}', falling back to file storage at {self.file_path}")
-    
-    def validate(self) -> bool:
-        """Validate the anomaly repository configuration and state.
-        
-        Returns:
-            True if the repository is valid, False otherwise.
-        
-        Raises:
-            ValidationError: If validation fails.
-        """
-        if self.repository_type == 'file':
-            # Check if the directory exists
-            if not os.path.exists(os.path.dirname(self.file_path)):
-                raise ValidationError(f"Repository directory does not exist: {os.path.dirname(self.file_path)}")
-        
-        elif self.repository_type == 'mongodb':
-            # Check MongoDB connection
-            if not self.mongo_client:
-                raise ValidationError("MongoDB client is not initialized")
-            
-            try:
-                # Test connection
-                self.mongo_client.server_info()
-            except Exception as e:
-                raise ValidationError(f"MongoDB connection failed: {str(e)}")
-        
-        return True
-    
-    def save_anomalies(self, anomalies: List[Anomaly]) -> None:
-        """Save anomalies to the repository.
+    def detect_anomalies(self, df: pd.DataFrame, table_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Detect anomalies in a DataFrame.
         
         Args:
-            anomalies: List of Anomaly instances to save.
-        
-        Raises:
-            ProcessingError: If saving fails.
-        """
-        if not anomalies:
-            self.logger.info("No anomalies to save")
-            return
-        
-        self.logger.info(f"Saving {len(anomalies)} anomalies to repository")
-        
-        if self.repository_type == 'file':
-            try:
-                # Load existing anomalies
-                existing_anomalies = []
-                if os.path.exists(self.file_path):
-                    with open(self.file_path, 'r') as f:
-                        existing_data = json.load(f)
-                        existing_anomalies = [Anomaly.from_dict(a) for a in existing_data]
-                
-                # Add new anomalies
-                all_anomalies = existing_anomalies + anomalies
-                
-                # Remove duplicates based on ID
-                unique_anomalies = {}
-                for anomaly in all_anomalies:
-                    unique_anomalies[anomaly.id] = anomaly
-                
-                # Convert to dictionaries
-                anomaly_dicts = [anomaly.to_dict() for anomaly in unique_anomalies.values()]
-                
-                # Save to file
-                with open(self.file_path, 'w') as f:
-                    json.dump(anomaly_dicts, f, indent=2)
-                
-                self.logger.info(f"Saved {len(anomalies)} anomalies to file repository")
-            except Exception as e:
-                raise ProcessingError(f"Error saving anomalies to file: {str(e)}")
-        
-        elif self.repository_type == 'mongodb':
-            try:
-                # Convert anomalies to dictionaries
-                anomaly_dicts = [anomaly.to_dict() for anomaly in anomalies]
-                
-                # Insert or update anomalies
-                for anomaly_dict in anomaly_dicts:
-                    self.mongo_collection.update_one(
-                        {'id': anomaly_dict['id']},
-                        {'$set': anomaly_dict},
-                        upsert=True
-                    )
-                
-                self.logger.info(f"Saved {len(anomalies)} anomalies to MongoDB repository")
-            except Exception as e:
-                raise ProcessingError(f"Error saving anomalies to MongoDB: {str(e)}")
-    
-    def get_anomalies(self, filters: Dict[str, Any] = None) -> List[Anomaly]:
-        """Get anomalies from the repository.
-        
-        Args:
-            filters: Dictionary of filters to apply.
+            df: DataFrame to analyze.
+            table_name: Name of the table.
         
         Returns:
-            List of Anomaly instances.
-        
-        Raises:
-            ProcessingError: If retrieval fails.
+            Tuple of (anomalies DataFrame, normal DataFrame).
         """
-        filters = filters or {}
-        
-        self.logger.info(f"Retrieving anomalies from repository with filters: {filters}")
-        
-        if self.repository_type == 'file':
-            try:
-                if not os.path.exists(self.file_path):
-                    return []
-                
-                # Load anomalies from file
-                with open(self.file_path, 'r') as f:
-                    anomaly_dicts = json.load(f)
-                
-                # Convert to Anomaly instances
-                anomalies = [Anomaly.from_dict(a) for a in anomaly_dicts]
-                
-                # Apply filters
-                filtered_anomalies = []
-                for anomaly in anomalies:
-                    match = True
-                    for key, value in filters.items():
-                        if hasattr(anomaly, key):
-                            if getattr(anomaly, key) != value:
-                                match = False
-                                break
-                    
-                    if match:
-                        filtered_anomalies.append(anomaly)
-                
-                self.logger.info(f"Retrieved {len(filtered_anomalies)} anomalies from file repository")
-                return filtered_anomalies
-            except Exception as e:
-                raise ProcessingError(f"Error retrieving anomalies from file: {str(e)}")
-        
-        elif self.repository_type == 'mongodb':
-            try:
-                # Query MongoDB
-                cursor = self.mongo_collection.find(filters)
-                
-                # Convert to Anomaly instances
-                anomalies = [Anomaly.from_dict(a) for a in cursor]
-                
-                self.logger.info(f"Retrieved {len(anomalies)} anomalies from MongoDB repository")
-                return anomalies
-            except Exception as e:
-                raise ProcessingError(f"Error retrieving anomalies from MongoDB: {str(e)}")
-        
-        return []
+        raise NotImplementedError("Subclasses must implement detect_anomalies()")
 
 
-class StatisticalAnomalyDetector(Component):
-    """Component for detecting anomalies using statistical methods."""
+class StatisticalAnomalyDetector(AnomalyDetector):
+    """Anomaly detector using statistical methods."""
     
     def __init__(self, config_manager: ConfigManager):
         """Initialize the statistical anomaly detector.
@@ -345,6 +54,7 @@ class StatisticalAnomalyDetector(Component):
             config_manager: Configuration manager instance.
         """
         super().__init__(config_manager)
+        self.methods = None
         self.z_score_threshold = None
         self.iqr_factor = None
     
@@ -354,157 +64,94 @@ class StatisticalAnomalyDetector(Component):
         Raises:
             ConfigurationError: If the detector cannot be initialized.
         """
-        # Get configuration
-        statistical_config = self.config_manager.get('anomaly_detection.methods.statistical', {})
-        self.z_score_threshold = statistical_config.get('z_score_threshold', 3.0)
-        self.iqr_factor = statistical_config.get('iqr_factor', 1.5)
+        self.methods = self.config_manager.get('anomaly_detection.methods.statistical', {})
+        self.z_score_threshold = self.config_manager.get('anomaly_detection.methods.statistical.z_score.threshold', 3.0)
+        self.iqr_factor = self.config_manager.get('anomaly_detection.methods.statistical.iqr.factor', 1.5)
         
-        self.logger.info(f"Statistical anomaly detector initialized with z-score threshold {self.z_score_threshold} and IQR factor {self.iqr_factor}")
+        self.logger.info(f"Statistical anomaly detector initialized with z-score threshold: {self.z_score_threshold}, IQR factor: {self.iqr_factor}")
     
-    def validate(self) -> bool:
-        """Validate the statistical anomaly detector configuration and state.
-        
-        Returns:
-            True if the detector is valid, False otherwise.
-        
-        Raises:
-            ValidationError: If validation fails.
-        """
-        if self.z_score_threshold <= 0:
-            raise ValidationError(f"Invalid z-score threshold: {self.z_score_threshold}")
-        
-        if self.iqr_factor <= 0:
-            raise ValidationError(f"Invalid IQR factor: {self.iqr_factor}")
-        
-        return True
-    
-    def detect_anomalies(self, df: pd.DataFrame, table_name: str, domain: str) -> Tuple[List[Anomaly], pd.DataFrame]:
-        """Detect anomalies in a DataFrame using statistical methods.
+    def detect_anomalies(self, df: pd.DataFrame, table_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Detect anomalies using statistical methods.
         
         Args:
             df: DataFrame to analyze.
             table_name: Name of the table.
-            domain: Domain name.
         
         Returns:
-            Tuple of (list of detected anomalies, DataFrame with anomaly flags).
+            Tuple of (anomalies DataFrame, normal DataFrame).
         """
-        if not validate_data_frame(df):
-            self.logger.warning(f"Invalid DataFrame for table {table_name}")
-            return [], df
+        self.logger.info(f"Detecting statistical anomalies in table: {table_name}")
         
-        self.logger.info(f"Detecting statistical anomalies in table {table_name}")
+        # Create a copy of the DataFrame
+        df_copy = df.copy()
         
-        # Create a copy of the DataFrame with anomaly flags
-        result_df = df.copy()
-        result_df['is_anomaly'] = False
-        result_df['anomaly_score'] = 0.0
-        result_df['anomaly_method'] = None
+        # Create a mask for anomalies
+        anomaly_mask = pd.Series(False, index=df.index)
         
-        # Get numeric columns
-        numeric_columns = df.select_dtypes(include=np.number).columns.tolist()
+        # Apply z-score method if enabled
+        if self.config_manager.get('anomaly_detection.methods.statistical.z_score.enabled', True):
+            z_score_mask = self._detect_z_score_anomalies(df_copy)
+            anomaly_mask = anomaly_mask | z_score_mask
         
-        if not numeric_columns:
-            self.logger.info(f"No numeric columns found in table {table_name}")
-            return [], result_df
+        # Apply IQR method if enabled
+        if self.config_manager.get('anomaly_detection.methods.statistical.iqr.enabled', True):
+            iqr_mask = self._detect_iqr_anomalies(df_copy)
+            anomaly_mask = anomaly_mask | iqr_mask
         
-        # Detect anomalies using z-score
-        z_score_anomalies = self._detect_z_score_anomalies(df, numeric_columns)
+        # Split data into anomalies and normal
+        anomalies_df = df_copy[anomaly_mask].copy()
+        normal_df = df_copy[~anomaly_mask].copy()
         
-        # Detect anomalies using IQR
-        iqr_anomalies = self._detect_iqr_anomalies(df, numeric_columns)
-        
-        # Combine anomalies
-        anomaly_indices = z_score_anomalies.union(iqr_anomalies)
-        
-        if not anomaly_indices:
-            self.logger.info(f"No statistical anomalies detected in table {table_name}")
-            return [], result_df
-        
-        # Update result DataFrame
-        for idx in anomaly_indices:
-            if idx in z_score_anomalies:
-                result_df.loc[idx, 'anomaly_method'] = 'z_score'
-                result_df.loc[idx, 'anomaly_score'] = 1.0
-            else:
-                result_df.loc[idx, 'anomaly_method'] = 'iqr'
-                result_df.loc[idx, 'anomaly_score'] = 0.9
-            
-            result_df.loc[idx, 'is_anomaly'] = True
-        
-        # Create Anomaly objects
-        anomalies = []
-        for idx in anomaly_indices:
-            row = df.iloc[idx].to_dict()
-            
-            # Create context
-            context = {
-                'detection_columns': numeric_columns,
-                'row_index': idx
-            }
-            
-            # Create anomaly
-            anomaly = Anomaly(
-                id=f"{table_name}_{idx}",
-                table_name=table_name,
-                domain=domain,
-                detection_method=result_df.loc[idx, 'anomaly_method'],
-                detection_score=float(result_df.loc[idx, 'anomaly_score']),
-                original_row=row,
-                context=context,
-                created_at=datetime.now()
-            )
-            
-            anomalies.append(anomaly)
-        
-        self.logger.info(f"Detected {len(anomalies)} statistical anomalies in table {table_name}")
-        return anomalies, result_df
+        self.logger.info(f"Detected {len(anomalies_df)} statistical anomalies in table: {table_name}")
+        return anomalies_df, normal_df
     
-    def _detect_z_score_anomalies(self, df: pd.DataFrame, numeric_columns: List[str]) -> set:
+    def _detect_z_score_anomalies(self, df: pd.DataFrame) -> pd.Series:
         """Detect anomalies using z-score method.
         
         Args:
             df: DataFrame to analyze.
-            numeric_columns: List of numeric column names.
         
         Returns:
-            Set of anomaly indices.
+            Boolean mask indicating anomalies.
         """
-        anomaly_indices = set()
+        self.logger.info("Detecting anomalies using z-score method")
         
-        for column in numeric_columns:
+        # Create a mask for anomalies
+        anomaly_mask = pd.Series(False, index=df.index)
+        
+        # Apply z-score method to numeric columns
+        for column in df.select_dtypes(include=np.number).columns:
             # Skip columns with all NaN values
             if df[column].isna().all():
                 continue
             
             # Calculate z-scores
-            mean = df[column].mean()
-            std = df[column].std()
+            z_scores = np.abs(stats.zscore(df[column].fillna(df[column].mean())))
             
-            if std == 0:
-                continue
+            # Identify anomalies
+            column_anomalies = z_scores > self.z_score_threshold
             
-            z_scores = (df[column] - mean) / std
-            
-            # Find anomalies
-            anomalies = df[abs(z_scores) > self.z_score_threshold].index
-            anomaly_indices.update(anomalies)
+            # Update mask
+            anomaly_mask = anomaly_mask | column_anomalies
         
-        return anomaly_indices
+        return anomaly_mask
     
-    def _detect_iqr_anomalies(self, df: pd.DataFrame, numeric_columns: List[str]) -> set:
+    def _detect_iqr_anomalies(self, df: pd.DataFrame) -> pd.Series:
         """Detect anomalies using IQR method.
         
         Args:
             df: DataFrame to analyze.
-            numeric_columns: List of numeric column names.
         
         Returns:
-            Set of anomaly indices.
+            Boolean mask indicating anomalies.
         """
-        anomaly_indices = set()
+        self.logger.info("Detecting anomalies using IQR method")
         
-        for column in numeric_columns:
+        # Create a mask for anomalies
+        anomaly_mask = pd.Series(False, index=df.index)
+        
+        # Apply IQR method to numeric columns
+        for column in df.select_dtypes(include=np.number).columns:
             # Skip columns with all NaN values
             if df[column].isna().all():
                 continue
@@ -514,454 +161,358 @@ class StatisticalAnomalyDetector(Component):
             q3 = df[column].quantile(0.75)
             iqr = q3 - q1
             
-            if iqr == 0:
-                continue
-            
             # Define bounds
-            lower_bound = q1 - (self.iqr_factor * iqr)
-            upper_bound = q3 + (self.iqr_factor * iqr)
+            lower_bound = q1 - self.iqr_factor * iqr
+            upper_bound = q3 + self.iqr_factor * iqr
             
-            # Find anomalies
-            anomalies = df[(df[column] < lower_bound) | (df[column] > upper_bound)].index
-            anomaly_indices.update(anomalies)
+            # Identify anomalies
+            column_anomalies = (df[column] < lower_bound) | (df[column] > upper_bound)
+            
+            # Update mask
+            anomaly_mask = anomaly_mask | column_anomalies
         
-        return anomaly_indices
+        return anomaly_mask
 
 
-class PatternAnomalyDetector(Component):
-    """Component for detecting anomalies using pattern recognition algorithms."""
+class RuleBasedAnomalyDetector(AnomalyDetector):
+    """Anomaly detector using rule-based methods."""
     
     def __init__(self, config_manager: ConfigManager):
-        """Initialize the pattern anomaly detector.
+        """Initialize the rule-based anomaly detector.
         
         Args:
             config_manager: Configuration manager instance.
         """
         super().__init__(config_manager)
-        self.algorithms = None
-        self.models = {}
-        self.output_dir = None
+        self.rules = None
     
     def initialize(self) -> None:
-        """Initialize the pattern anomaly detector.
+        """Initialize the rule-based anomaly detector.
         
         Raises:
             ConfigurationError: If the detector cannot be initialized.
         """
-        # Get configuration
-        pattern_config = self.config_manager.get('anomaly_detection.methods.pattern', {})
-        self.algorithms = pattern_config.get('algorithms', ['isolation_forest', 'one_class_svm', 'local_outlier_factor'])
+        self.rules = self.config_manager.get('anomaly_detection.methods.rule_based.rules', [])
         
-        # Create output directory for models
-        self.output_dir = os.path.join(
-            self.config_manager.get('general.output_directory', '/output/dwsf'),
-            'anomaly_detection',
-            'models'
-        )
-        os.makedirs(self.output_dir, exist_ok=True)
-        
-        self.logger.info(f"Pattern anomaly detector initialized with algorithms: {self.algorithms}")
+        self.logger.info(f"Rule-based anomaly detector initialized with {len(self.rules)} rules")
     
-    def validate(self) -> bool:
-        """Validate the pattern anomaly detector configuration and state.
-        
-        Returns:
-            True if the detector is valid, False otherwise.
-        
-        Raises:
-            ValidationError: If validation fails.
-        """
-        if not self.algorithms:
-            raise ValidationError("No pattern recognition algorithms specified")
-        
-        if not os.path.exists(self.output_dir):
-            raise ValidationError(f"Model output directory does not exist: {self.output_dir}")
-        
-        return True
-    
-    def detect_anomalies(self, df: pd.DataFrame, table_name: str, domain: str) -> Tuple[List[Anomaly], pd.DataFrame]:
-        """Detect anomalies in a DataFrame using pattern recognition algorithms.
+    def detect_anomalies(self, df: pd.DataFrame, table_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Detect anomalies using rule-based methods.
         
         Args:
             df: DataFrame to analyze.
             table_name: Name of the table.
-            domain: Domain name.
         
         Returns:
-            Tuple of (list of detected anomalies, DataFrame with anomaly flags).
+            Tuple of (anomalies DataFrame, normal DataFrame).
         """
-        if not validate_data_frame(df):
-            self.logger.warning(f"Invalid DataFrame for table {table_name}")
-            return [], df
+        self.logger.info(f"Detecting rule-based anomalies in table: {table_name}")
         
-        self.logger.info(f"Detecting pattern anomalies in table {table_name}")
+        # Create a copy of the DataFrame
+        df_copy = df.copy()
         
-        # Create a copy of the DataFrame with anomaly flags
-        result_df = df.copy()
-        if 'is_anomaly' not in result_df.columns:
-            result_df['is_anomaly'] = False
-        if 'anomaly_score' not in result_df.columns:
-            result_df['anomaly_score'] = 0.0
-        if 'anomaly_method' not in result_df.columns:
-            result_df['anomaly_method'] = None
+        # Create a mask for anomalies
+        anomaly_mask = pd.Series(False, index=df.index)
         
-        # Get numeric columns
-        numeric_columns = df.select_dtypes(include=np.number).columns.tolist()
-        
-        if not numeric_columns:
-            self.logger.info(f"No numeric columns found in table {table_name}")
-            return [], result_df
-        
-        # Prepare data
-        X = df[numeric_columns].copy()
-        
-        # Handle missing values
-        X = X.fillna(X.mean())
-        
-        # Standardize data
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-        
-        # Detect anomalies using each algorithm
-        anomaly_indices = set()
-        anomaly_scores = {}
-        
-        for algorithm in self.algorithms:
-            try:
-                if algorithm == 'isolation_forest':
-                    anomalies, scores = self._detect_isolation_forest_anomalies(X_scaled, table_name)
-                elif algorithm == 'one_class_svm':
-                    anomalies, scores = self._detect_one_class_svm_anomalies(X_scaled, table_name)
-                elif algorithm == 'local_outlier_factor':
-                    anomalies, scores = self._detect_lof_anomalies(X_scaled, table_name)
-                else:
-                    self.logger.warning(f"Unsupported algorithm: {algorithm}")
-                    continue
-                
-                # Update anomaly indices and scores
-                anomaly_indices.update(anomalies)
-                
-                for idx, score in scores.items():
-                    if idx not in anomaly_scores or score > anomaly_scores[idx][1]:
-                        anomaly_scores[idx] = (algorithm, score)
-            except Exception as e:
-                self.logger.error(f"Error detecting anomalies with {algorithm}: {str(e)}")
-        
-        if not anomaly_indices:
-            self.logger.info(f"No pattern anomalies detected in table {table_name}")
-            return [], result_df
-        
-        # Update result DataFrame
-        for idx in anomaly_indices:
-            algorithm, score = anomaly_scores.get(idx, ('unknown', 0.8))
-            
-            # Only update if not already marked as anomaly or if score is higher
-            if not result_df.loc[idx, 'is_anomaly'] or score > result_df.loc[idx, 'anomaly_score']:
-                result_df.loc[idx, 'anomaly_method'] = algorithm
-                result_df.loc[idx, 'anomaly_score'] = score
-                result_df.loc[idx, 'is_anomaly'] = True
-        
-        # Create Anomaly objects
-        anomalies = []
-        for idx in anomaly_indices:
-            # Skip if already marked as anomaly by another method with higher score
-            if result_df.loc[idx, 'anomaly_method'] != anomaly_scores[idx][0]:
-                continue
-            
-            row = df.iloc[idx].to_dict()
-            
-            # Create context
-            context = {
-                'detection_columns': numeric_columns,
-                'row_index': idx,
-                'algorithm': anomaly_scores[idx][0]
-            }
-            
-            # Create anomaly
-            anomaly = Anomaly(
-                id=f"{table_name}_{idx}_{anomaly_scores[idx][0]}",
-                table_name=table_name,
-                domain=domain,
-                detection_method=anomaly_scores[idx][0],
-                detection_score=float(anomaly_scores[idx][1]),
-                original_row=row,
-                context=context,
-                created_at=datetime.now()
-            )
-            
-            anomalies.append(anomaly)
-        
-        self.logger.info(f"Detected {len(anomalies)} pattern anomalies in table {table_name}")
-        return anomalies, result_df
-    
-    def _detect_isolation_forest_anomalies(self, X: np.ndarray, table_name: str) -> Tuple[set, Dict[int, float]]:
-        """Detect anomalies using Isolation Forest algorithm.
-        
-        Args:
-            X: Input data matrix.
-            table_name: Name of the table.
-        
-        Returns:
-            Tuple of (set of anomaly indices, dictionary mapping indices to anomaly scores).
-        """
-        # Check if model exists
-        model_path = os.path.join(self.output_dir, f"{table_name}_isolation_forest.pkl")
-        
-        if os.path.exists(model_path):
-            # Load existing model
-            with open(model_path, 'rb') as f:
-                model = pickle.load(f)
-        else:
-            # Create and train new model
-            model = IsolationForest(random_state=42, contamination=0.05)
-            model.fit(X)
-            
-            # Save model
-            with open(model_path, 'wb') as f:
-                pickle.dump(model, f)
-        
-        # Predict anomalies
-        y_pred = model.predict(X)
-        scores = model.decision_function(X)
-        
-        # Convert scores to anomaly scores (higher is more anomalous)
-        anomaly_scores = 1 - (scores + 0.5)  # Scale to [0, 1]
-        
-        # Find anomaly indices
-        anomaly_indices = set(np.where(y_pred == -1)[0])
-        
-        # Create score dictionary
-        score_dict = {idx: anomaly_scores[idx] for idx in anomaly_indices}
-        
-        return anomaly_indices, score_dict
-    
-    def _detect_one_class_svm_anomalies(self, X: np.ndarray, table_name: str) -> Tuple[set, Dict[int, float]]:
-        """Detect anomalies using One-Class SVM algorithm.
-        
-        Args:
-            X: Input data matrix.
-            table_name: Name of the table.
-        
-        Returns:
-            Tuple of (set of anomaly indices, dictionary mapping indices to anomaly scores).
-        """
-        # Check if model exists
-        model_path = os.path.join(self.output_dir, f"{table_name}_one_class_svm.pkl")
-        
-        if os.path.exists(model_path):
-            # Load existing model
-            with open(model_path, 'rb') as f:
-                model = pickle.load(f)
-        else:
-            # Create and train new model
-            model = OneClassSVM(nu=0.05, kernel="rbf", gamma='scale')
-            model.fit(X)
-            
-            # Save model
-            with open(model_path, 'wb') as f:
-                pickle.dump(model, f)
-        
-        # Predict anomalies
-        y_pred = model.predict(X)
-        scores = model.decision_function(X)
-        
-        # Convert scores to anomaly scores (higher is more anomalous)
-        anomaly_scores = -scores  # Negate scores so higher values are more anomalous
-        anomaly_scores = (anomaly_scores - anomaly_scores.min()) / (anomaly_scores.max() - anomaly_scores.min())  # Scale to [0, 1]
-        
-        # Find anomaly indices
-        anomaly_indices = set(np.where(y_pred == -1)[0])
-        
-        # Create score dictionary
-        score_dict = {idx: anomaly_scores[idx] for idx in anomaly_indices}
-        
-        return anomaly_indices, score_dict
-    
-    def _detect_lof_anomalies(self, X: np.ndarray, table_name: str) -> Tuple[set, Dict[int, float]]:
-        """Detect anomalies using Local Outlier Factor algorithm.
-        
-        Args:
-            X: Input data matrix.
-            table_name: Name of the table.
-        
-        Returns:
-            Tuple of (set of anomaly indices, dictionary mapping indices to anomaly scores).
-        """
-        # Create model (LOF doesn't need to be saved as it's not a fitted model)
-        model = LocalOutlierFactor(n_neighbors=20, contamination=0.05)
-        
-        # Predict anomalies
-        y_pred = model.fit_predict(X)
-        scores = model.negative_outlier_factor_
-        
-        # Convert scores to anomaly scores (higher is more anomalous)
-        anomaly_scores = -scores  # Negate scores so higher values are more anomalous
-        anomaly_scores = (anomaly_scores - anomaly_scores.min()) / (anomaly_scores.max() - anomaly_scores.min())  # Scale to [0, 1]
-        
-        # Find anomaly indices
-        anomaly_indices = set(np.where(y_pred == -1)[0])
-        
-        # Create score dictionary
-        score_dict = {idx: anomaly_scores[idx] for idx in anomaly_indices}
-        
-        return anomaly_indices, score_dict
-
-
-class BusinessRuleAnomalyDetector(Component):
-    """Component for detecting anomalies using business rules."""
-    
-    def __init__(self, config_manager: ConfigManager):
-        """Initialize the business rule anomaly detector.
-        
-        Args:
-            config_manager: Configuration manager instance.
-        """
-        super().__init__(config_manager)
-        self.rules_file = None
-        self.rules = {}
-    
-    def initialize(self) -> None:
-        """Initialize the business rule anomaly detector.
-        
-        Raises:
-            ConfigurationError: If the detector cannot be initialized.
-        """
-        # Get configuration
-        business_rules_config = self.config_manager.get('anomaly_detection.methods.business_rules', {})
-        self.rules_file = business_rules_config.get('rules_file')
-        
-        if self.rules_file:
-            try:
-                with open(self.rules_file, 'r') as f:
-                    self.rules = json.load(f)
-            except Exception as e:
-                self.logger.error(f"Error loading business rules from {self.rules_file}: {str(e)}")
-                self.rules = {}
-        
-        self.logger.info(f"Business rule anomaly detector initialized with {len(self.rules)} rules")
-    
-    def validate(self) -> bool:
-        """Validate the business rule anomaly detector configuration and state.
-        
-        Returns:
-            True if the detector is valid, False otherwise.
-        
-        Raises:
-            ValidationError: If validation fails.
-        """
-        if not self.rules:
-            self.logger.warning("No business rules defined")
-            return True
-        
-        return True
-    
-    def detect_anomalies(self, df: pd.DataFrame, table_name: str, domain: str) -> Tuple[List[Anomaly], pd.DataFrame]:
-        """Detect anomalies in a DataFrame using business rules.
-        
-        Args:
-            df: DataFrame to analyze.
-            table_name: Name of the table.
-            domain: Domain name.
-        
-        Returns:
-            Tuple of (list of detected anomalies, DataFrame with anomaly flags).
-        """
-        if not validate_data_frame(df):
-            self.logger.warning(f"Invalid DataFrame for table {table_name}")
-            return [], df
-        
-        self.logger.info(f"Detecting business rule anomalies in table {table_name}")
-        
-        # Create a copy of the DataFrame with anomaly flags
-        result_df = df.copy()
-        if 'is_anomaly' not in result_df.columns:
-            result_df['is_anomaly'] = False
-        if 'anomaly_score' not in result_df.columns:
-            result_df['anomaly_score'] = 0.0
-        if 'anomaly_method' not in result_df.columns:
-            result_df['anomaly_method'] = None
-        
-        # Get rules for this table
-        table_rules = self.rules.get(table_name, [])
-        
-        if not table_rules:
-            self.logger.info(f"No business rules defined for table {table_name}")
-            return [], result_df
-        
-        # Apply each rule
-        anomaly_indices = set()
-        rule_violations = {}
+        # Apply rules for this table
+        table_rules = [rule for rule in self.rules if rule.get('table') == table_name]
         
         for rule in table_rules:
-            rule_name = rule.get('name', 'unnamed_rule')
-            rule_condition = rule.get('condition')
-            rule_score = rule.get('score', 0.8)
+            column = rule.get('column')
+            condition = rule.get('condition')
             
-            if not rule_condition:
+            if column not in df_copy.columns:
+                self.logger.warning(f"Column {column} not found in table {table_name}")
                 continue
             
+            # Parse and apply condition
             try:
-                # Apply rule condition
-                mask = df.eval(rule_condition)
+                # Convert condition to a query string
+                query = f"{column} {condition}"
                 
-                # Find violations
-                violations = df[mask].index
+                # Apply query
+                rule_mask = df_copy.eval(query)
                 
-                # Update anomaly indices
-                anomaly_indices.update(violations)
-                
-                # Store rule violations
-                for idx in violations:
-                    if idx not in rule_violations or rule_score > rule_violations[idx][1]:
-                        rule_violations[idx] = (rule_name, rule_score)
+                # Update mask
+                anomaly_mask = anomaly_mask | rule_mask
             except Exception as e:
-                self.logger.error(f"Error applying rule {rule_name}: {str(e)}")
+                self.logger.error(f"Error applying rule {rule}: {str(e)}")
         
-        if not anomaly_indices:
-            self.logger.info(f"No business rule anomalies detected in table {table_name}")
-            return [], result_df
+        # Split data into anomalies and normal
+        anomalies_df = df_copy[anomaly_mask].copy()
+        normal_df = df_copy[~anomaly_mask].copy()
         
-        # Update result DataFrame
-        for idx in anomaly_indices:
-            rule_name, score = rule_violations.get(idx, ('unknown_rule', 0.8))
+        self.logger.info(f"Detected {len(anomalies_df)} rule-based anomalies in table: {table_name}")
+        return anomalies_df, normal_df
+
+
+class ClusteringAnomalyDetector(AnomalyDetector):
+    """Anomaly detector using clustering methods."""
+    
+    def __init__(self, config_manager: ConfigManager):
+        """Initialize the clustering anomaly detector.
+        
+        Args:
+            config_manager: Configuration manager instance.
+        """
+        super().__init__(config_manager)
+        self.method = None
+        self.contamination = None
+    
+    def initialize(self) -> None:
+        """Initialize the clustering anomaly detector.
+        
+        Raises:
+            ConfigurationError: If the detector cannot be initialized.
+        """
+        self.method = self.config_manager.get('anomaly_detection.methods.clustering.method', 'dbscan')
+        self.contamination = self.config_manager.get('anomaly_detection.methods.clustering.contamination', 0.05)
+        
+        self.logger.info(f"Clustering anomaly detector initialized with method: {self.method}, contamination: {self.contamination}")
+    
+    def detect_anomalies(self, df: pd.DataFrame, table_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Detect anomalies using clustering methods.
+        
+        Args:
+            df: DataFrame to analyze.
+            table_name: Name of the table.
+        
+        Returns:
+            Tuple of (anomalies DataFrame, normal DataFrame).
+        """
+        self.logger.info(f"Detecting clustering anomalies in table: {table_name}")
+        
+        # Create a copy of the DataFrame
+        df_copy = df.copy()
+        
+        # Create a mask for anomalies
+        anomaly_mask = pd.Series(False, index=df.index)
+        
+        # Select numeric columns
+        numeric_df = df_copy.select_dtypes(include=np.number)
+        
+        if numeric_df.empty:
+            self.logger.warning(f"No numeric columns found in table {table_name}")
+            return pd.DataFrame(), df_copy
+        
+        # Fill missing values
+        numeric_df = numeric_df.fillna(numeric_df.mean())
+        
+        # Apply clustering method
+        if self.method == 'dbscan':
+            anomaly_mask = self._detect_dbscan_anomalies(numeric_df)
+        elif self.method == 'isolation_forest':
+            anomaly_mask = self._detect_isolation_forest_anomalies(numeric_df)
+        else:
+            self.logger.warning(f"Unknown clustering method: {self.method}, falling back to DBSCAN")
+            anomaly_mask = self._detect_dbscan_anomalies(numeric_df)
+        
+        # Split data into anomalies and normal
+        anomalies_df = df_copy[anomaly_mask].copy()
+        normal_df = df_copy[~anomaly_mask].copy()
+        
+        self.logger.info(f"Detected {len(anomalies_df)} clustering anomalies in table: {table_name}")
+        return anomalies_df, normal_df
+    
+    def _detect_dbscan_anomalies(self, df: pd.DataFrame) -> pd.Series:
+        """Detect anomalies using DBSCAN clustering.
+        
+        Args:
+            df: DataFrame to analyze.
+        
+        Returns:
+            Boolean mask indicating anomalies.
+        """
+        self.logger.info("Detecting anomalies using DBSCAN clustering")
+        
+        try:
+            from sklearn.cluster import DBSCAN
+            from sklearn.preprocessing import StandardScaler
             
-            # Only update if not already marked as anomaly or if score is higher
-            if not result_df.loc[idx, 'is_anomaly'] or score > result_df.loc[idx, 'anomaly_score']:
-                result_df.loc[idx, 'anomaly_method'] = f"business_rule_{rule_name}"
-                result_df.loc[idx, 'anomaly_score'] = score
-                result_df.loc[idx, 'is_anomaly'] = True
+            # Standardize data
+            scaler = StandardScaler()
+            scaled_data = scaler.fit_transform(df)
+            
+            # Apply DBSCAN
+            dbscan = DBSCAN(eps=0.5, min_samples=5)
+            clusters = dbscan.fit_predict(scaled_data)
+            
+            # Identify anomalies (points labeled as -1)
+            anomaly_mask = pd.Series(clusters == -1, index=df.index)
+            
+            return anomaly_mask
+        except ImportError:
+            self.logger.warning("scikit-learn not installed, falling back to simple outlier detection")
+            
+            # Simple outlier detection
+            anomaly_mask = pd.Series(False, index=df.index)
+            
+            for column in df.columns:
+                mean = df[column].mean()
+                std = df[column].std()
+                
+                # Identify outliers
+                column_anomalies = np.abs(df[column] - mean) > 3 * std
+                
+                # Update mask
+                anomaly_mask = anomaly_mask | column_anomalies
+            
+            return anomaly_mask
+    
+    def _detect_isolation_forest_anomalies(self, df: pd.DataFrame) -> pd.Series:
+        """Detect anomalies using Isolation Forest.
         
-        # Create Anomaly objects
-        anomalies = []
-        for idx in anomaly_indices:
-            # Skip if already marked as anomaly by another method with higher score
-            if not result_df.loc[idx, 'anomaly_method'].startswith('business_rule_'):
+        Args:
+            df: DataFrame to analyze.
+        
+        Returns:
+            Boolean mask indicating anomalies.
+        """
+        self.logger.info("Detecting anomalies using Isolation Forest")
+        
+        try:
+            from sklearn.ensemble import IsolationForest
+            
+            # Apply Isolation Forest
+            isolation_forest = IsolationForest(contamination=self.contamination, random_state=42)
+            predictions = isolation_forest.fit_predict(df)
+            
+            # Identify anomalies (points labeled as -1)
+            anomaly_mask = pd.Series(predictions == -1, index=df.index)
+            
+            return anomaly_mask
+        except ImportError:
+            self.logger.warning("scikit-learn not installed, falling back to simple outlier detection")
+            
+            # Simple outlier detection
+            anomaly_mask = pd.Series(False, index=df.index)
+            
+            for column in df.columns:
+                mean = df[column].mean()
+                std = df[column].std()
+                
+                # Identify outliers
+                column_anomalies = np.abs(df[column] - mean) > 3 * std
+                
+                # Update mask
+                anomaly_mask = anomaly_mask | column_anomalies
+            
+            return anomaly_mask
+
+
+class AnomalyContextExtractor(Component):
+    """Component for extracting context for anomalies."""
+    
+    def __init__(self, config_manager: ConfigManager):
+        """Initialize the anomaly context extractor.
+        
+        Args:
+            config_manager: Configuration manager instance.
+        """
+        super().__init__(config_manager)
+        self.relationships = None
+    
+    def initialize(self) -> None:
+        """Initialize the anomaly context extractor.
+        
+        Raises:
+            ConfigurationError: If the extractor cannot be initialized.
+        """
+        # Relationships will be loaded from data
+        self.logger.info("Anomaly context extractor initialized")
+    
+    def extract_context(self, anomalies_df: pd.DataFrame, table_name: str, tables: Dict[str, pd.DataFrame], relationships: List[Dict[str, Any]]) -> Dict[str, pd.DataFrame]:
+        """Extract context for anomalies.
+        
+        This method identifies related records in other tables
+        that provide context for the anomalies.
+        
+        Args:
+            anomalies_df: DataFrame containing anomalies.
+            table_name: Name of the table containing anomalies.
+            tables: Dictionary mapping table names to DataFrames.
+            relationships: List of relationship dictionaries.
+        
+        Returns:
+            Dictionary mapping table names to DataFrames containing context records.
+        """
+        self.logger.info(f"Extracting context for anomalies in table: {table_name}")
+        
+        if anomalies_df.empty:
+            self.logger.info(f"No anomalies found in table {table_name}, skipping context extraction")
+            return {}
+        
+        # Store context records
+        context = {}
+        
+        # Find relationships where this table is parent or child
+        parent_relationships = [r for r in relationships if r.get('parent_table') == table_name]
+        child_relationships = [r for r in relationships if r.get('child_table') == table_name]
+        
+        # Extract context from child tables
+        for relationship in parent_relationships:
+            child_table = relationship.get('child_table')
+            parent_column = relationship.get('parent_column')
+            child_column = relationship.get('child_column')
+            
+            if child_table not in tables:
+                self.logger.warning(f"Child table {child_table} not found")
                 continue
             
-            row = df.iloc[idx].to_dict()
+            if parent_column not in anomalies_df.columns:
+                self.logger.warning(f"Parent column {parent_column} not found in table {table_name}")
+                continue
             
-            # Create context
-            context = {
-                'rule_name': rule_violations[idx][0],
-                'row_index': idx
-            }
+            if child_column not in tables[child_table].columns:
+                self.logger.warning(f"Child column {child_column} not found in table {child_table}")
+                continue
             
-            # Create anomaly
-            anomaly = Anomaly(
-                id=f"{table_name}_{idx}_rule_{rule_violations[idx][0]}",
-                table_name=table_name,
-                domain=domain,
-                detection_method=f"business_rule_{rule_violations[idx][0]}",
-                detection_score=float(rule_violations[idx][1]),
-                original_row=row,
-                context=context,
-                created_at=datetime.now()
-            )
+            # Get values from anomalies
+            parent_values = set(anomalies_df[parent_column].dropna())
             
-            anomalies.append(anomaly)
+            if not parent_values:
+                continue
+            
+            # Find related records in child table
+            child_df = tables[child_table]
+            related_records = child_df[child_df[child_column].isin(parent_values)]
+            
+            if not related_records.empty:
+                context[child_table] = related_records
         
-        self.logger.info(f"Detected {len(anomalies)} business rule anomalies in table {table_name}")
-        return anomalies, result_df
+        # Extract context from parent tables
+        for relationship in child_relationships:
+            parent_table = relationship.get('parent_table')
+            parent_column = relationship.get('parent_column')
+            child_column = relationship.get('child_column')
+            
+            if parent_table not in tables:
+                self.logger.warning(f"Parent table {parent_table} not found")
+                continue
+            
+            if child_column not in anomalies_df.columns:
+                self.logger.warning(f"Child column {child_column} not found in table {table_name}")
+                continue
+            
+            if parent_column not in tables[parent_table].columns:
+                self.logger.warning(f"Parent column {parent_column} not found in table {parent_table}")
+                continue
+            
+            # Get values from anomalies
+            child_values = set(anomalies_df[child_column].dropna())
+            
+            if not child_values:
+                continue
+            
+            # Find related records in parent table
+            parent_df = tables[parent_table]
+            related_records = parent_df[parent_df[parent_column].isin(child_values)]
+            
+            if not related_records.empty:
+                context[parent_table] = related_records
+        
+        self.logger.info(f"Extracted context from {len(context)} related tables for anomalies in table: {table_name}")
+        return context
 
 
 class AnomalyDetectionPipeline(Pipeline):
@@ -975,290 +526,255 @@ class AnomalyDetectionPipeline(Pipeline):
         """
         super().__init__(config_manager)
         self.statistical_detector = None
-        self.pattern_detector = None
-        self.business_rule_detector = None
-        self.anomaly_repository = None
+        self.rule_based_detector = None
+        self.clustering_detector = None
+        self.context_extractor = None
     
     def initialize(self) -> None:
-        """Initialize the pipeline.
+        """Initialize the anomaly detection pipeline.
         
         Raises:
             ConfigurationError: If the pipeline cannot be initialized.
         """
+        super().initialize()
+        
         # Initialize components
         self.statistical_detector = StatisticalAnomalyDetector(self.config_manager)
         self.statistical_detector.initialize()
         
-        self.pattern_detector = PatternAnomalyDetector(self.config_manager)
-        self.pattern_detector.initialize()
+        self.rule_based_detector = RuleBasedAnomalyDetector(self.config_manager)
+        self.rule_based_detector.initialize()
         
-        self.business_rule_detector = BusinessRuleAnomalyDetector(self.config_manager)
-        self.business_rule_detector.initialize()
+        self.clustering_detector = ClusteringAnomalyDetector(self.config_manager)
+        self.clustering_detector.initialize()
         
-        self.anomaly_repository = AnomalyRepository(self.config_manager)
-        self.anomaly_repository.initialize()
+        self.context_extractor = AnomalyContextExtractor(self.config_manager)
+        self.context_extractor.initialize()
         
-        # Add pipeline steps
-        self.add_step(StatisticalAnomalyDetectionStep(self.config_manager, self.statistical_detector))
-        self.add_step(PatternAnomalyDetectionStep(self.config_manager, self.pattern_detector))
-        self.add_step(BusinessRuleAnomalyDetectionStep(self.config_manager, self.business_rule_detector))
-        self.add_step(AnomalyStorageStep(self.config_manager, self.anomaly_repository))
+        # Initialize steps
+        self.steps = [
+            PipelineStep(self.detect_anomalies),
+            PipelineStep(self.extract_context),
+            PipelineStep(self.save_results)
+        ]
         
         self.logger.info("Anomaly detection pipeline initialized")
     
-    def validate(self) -> bool:
-        """Validate the pipeline configuration and state.
-        
-        Returns:
-            True if the pipeline is valid, False otherwise.
-        
-        Raises:
-            ValidationError: If validation fails.
-        """
-        # Validate components
-        self.statistical_detector.validate()
-        self.pattern_detector.validate()
-        self.business_rule_detector.validate()
-        self.anomaly_repository.validate()
-        
-        return True
-
-
-class StatisticalAnomalyDetectionStep(PipelineStep):
-    """Pipeline step for detecting anomalies using statistical methods."""
-    
-    def __init__(self, config_manager: ConfigManager, detector: StatisticalAnomalyDetector):
-        """Initialize the statistical anomaly detection step.
+    def detect_anomalies(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect anomalies in the data.
         
         Args:
-            config_manager: Configuration manager instance.
-            detector: StatisticalAnomalyDetector instance.
-        """
-        super().__init__(config_manager)
-        self.detector = detector
-    
-    def execute(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute the statistical anomaly detection step.
-        
-        Args:
-            input_data: Dictionary with data, relationships, and domain partitions.
+            data: Input data with tables and domain partitions.
         
         Returns:
-            Dictionary with input data and detected anomalies.
+            Updated data with detected anomalies.
         
         Raises:
             ProcessingError: If anomaly detection fails.
         """
-        self.logger.info("Detecting statistical anomalies")
+        self.logger.info("Detecting anomalies")
         
-        if not input_data or 'domain_partitions' not in input_data:
-            raise ProcessingError("No domain partitions to analyze")
-        
-        # Check if statistical anomaly detection is enabled
-        if not self.config_manager.get('anomaly_detection.methods.statistical.enabled', True):
-            self.logger.info("Statistical anomaly detection is disabled in configuration")
-            return {**input_data, 'anomalies': []}
-        
-        # Detect anomalies in each domain partition
-        all_anomalies = []
-        domain_partitions = input_data['domain_partitions']
-        
-        for domain, tables in domain_partitions.items():
-            for table_name, df in tables.items():
-                try:
-                    anomalies, df_with_flags = self.detector.detect_anomalies(df, table_name, domain)
-                    all_anomalies.extend(anomalies)
-                    
-                    # Update DataFrame in domain partition
-                    domain_partitions[domain][table_name] = df_with_flags
-                except Exception as e:
-                    self.logger.error(f"Error detecting statistical anomalies in table {table_name}: {str(e)}")
-                    # Continue with other tables
-        
-        self.logger.info(f"Detected {len(all_anomalies)} statistical anomalies in total")
-        
-        return {
-            **input_data,
-            'domain_partitions': domain_partitions,
-            'anomalies': all_anomalies
-        }
-
-
-class PatternAnomalyDetectionStep(PipelineStep):
-    """Pipeline step for detecting anomalies using pattern recognition algorithms."""
-    
-    def __init__(self, config_manager: ConfigManager, detector: PatternAnomalyDetector):
-        """Initialize the pattern anomaly detection step.
-        
-        Args:
-            config_manager: Configuration manager instance.
-            detector: PatternAnomalyDetector instance.
-        """
-        super().__init__(config_manager)
-        self.detector = detector
-    
-    def execute(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute the pattern anomaly detection step.
-        
-        Args:
-            input_data: Dictionary with data, relationships, domain partitions, and anomalies.
-        
-        Returns:
-            Dictionary with input data and updated anomalies.
-        
-        Raises:
-            ProcessingError: If anomaly detection fails.
-        """
-        self.logger.info("Detecting pattern anomalies")
-        
-        if not input_data or 'domain_partitions' not in input_data:
-            raise ProcessingError("No domain partitions to analyze")
-        
-        # Check if pattern anomaly detection is enabled
-        if not self.config_manager.get('anomaly_detection.methods.pattern.enabled', True):
-            self.logger.info("Pattern anomaly detection is disabled in configuration")
-            return input_data
-        
-        # Get existing anomalies
-        existing_anomalies = input_data.get('anomalies', [])
-        
-        # Detect anomalies in each domain partition
-        new_anomalies = []
-        domain_partitions = input_data['domain_partitions']
-        
-        for domain, tables in domain_partitions.items():
-            for table_name, df in tables.items():
-                try:
-                    anomalies, df_with_flags = self.detector.detect_anomalies(df, table_name, domain)
-                    new_anomalies.extend(anomalies)
-                    
-                    # Update DataFrame in domain partition
-                    domain_partitions[domain][table_name] = df_with_flags
-                except Exception as e:
-                    self.logger.error(f"Error detecting pattern anomalies in table {table_name}: {str(e)}")
-                    # Continue with other tables
-        
-        self.logger.info(f"Detected {len(new_anomalies)} pattern anomalies in total")
-        
-        # Combine anomalies
-        all_anomalies = existing_anomalies + new_anomalies
-        
-        return {
-            **input_data,
-            'domain_partitions': domain_partitions,
-            'anomalies': all_anomalies
-        }
-
-
-class BusinessRuleAnomalyDetectionStep(PipelineStep):
-    """Pipeline step for detecting anomalies using business rules."""
-    
-    def __init__(self, config_manager: ConfigManager, detector: BusinessRuleAnomalyDetector):
-        """Initialize the business rule anomaly detection step.
-        
-        Args:
-            config_manager: Configuration manager instance.
-            detector: BusinessRuleAnomalyDetector instance.
-        """
-        super().__init__(config_manager)
-        self.detector = detector
-    
-    def execute(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute the business rule anomaly detection step.
-        
-        Args:
-            input_data: Dictionary with data, relationships, domain partitions, and anomalies.
-        
-        Returns:
-            Dictionary with input data and updated anomalies.
-        
-        Raises:
-            ProcessingError: If anomaly detection fails.
-        """
-        self.logger.info("Detecting business rule anomalies")
-        
-        if not input_data or 'domain_partitions' not in input_data:
-            raise ProcessingError("No domain partitions to analyze")
-        
-        # Check if business rule anomaly detection is enabled
-        if not self.config_manager.get('anomaly_detection.methods.business_rules.enabled', True):
-            self.logger.info("Business rule anomaly detection is disabled in configuration")
-            return input_data
-        
-        # Get existing anomalies
-        existing_anomalies = input_data.get('anomalies', [])
-        
-        # Detect anomalies in each domain partition
-        new_anomalies = []
-        domain_partitions = input_data['domain_partitions']
-        
-        for domain, tables in domain_partitions.items():
-            for table_name, df in tables.items():
-                try:
-                    anomalies, df_with_flags = self.detector.detect_anomalies(df, table_name, domain)
-                    new_anomalies.extend(anomalies)
-                    
-                    # Update DataFrame in domain partition
-                    domain_partitions[domain][table_name] = df_with_flags
-                except Exception as e:
-                    self.logger.error(f"Error detecting business rule anomalies in table {table_name}: {str(e)}")
-                    # Continue with other tables
-        
-        self.logger.info(f"Detected {len(new_anomalies)} business rule anomalies in total")
-        
-        # Combine anomalies
-        all_anomalies = existing_anomalies + new_anomalies
-        
-        return {
-            **input_data,
-            'domain_partitions': domain_partitions,
-            'anomalies': all_anomalies
-        }
-
-
-class AnomalyStorageStep(PipelineStep):
-    """Pipeline step for storing detected anomalies."""
-    
-    def __init__(self, config_manager: ConfigManager, repository: AnomalyRepository):
-        """Initialize the anomaly storage step.
-        
-        Args:
-            config_manager: Configuration manager instance.
-            repository: AnomalyRepository instance.
-        """
-        super().__init__(config_manager)
-        self.repository = repository
-    
-    def execute(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute the anomaly storage step.
-        
-        Args:
-            input_data: Dictionary with data, relationships, domain partitions, and anomalies.
-        
-        Returns:
-            Dictionary with input data and stored anomalies.
-        
-        Raises:
-            ProcessingError: If anomaly storage fails.
-        """
-        self.logger.info("Storing detected anomalies")
-        
-        if not input_data:
-            raise ProcessingError("No input data")
-        
-        # Get anomalies
-        anomalies = input_data.get('anomalies', [])
-        
-        if not anomalies:
-            self.logger.info("No anomalies to store")
-            return input_data
-        
-        # Store anomalies
         try:
-            self.repository.save_anomalies(anomalies)
-            self.logger.info(f"Stored {len(anomalies)} anomalies in repository")
+            tables = data.get('tables', {})
+            
+            if not tables:
+                self.logger.warning("No tables found for anomaly detection")
+                return data
+            
+            # Store anomalies and normal data
+            anomalies = {}
+            normal_data = {}
+            
+            # Process each table
+            for table_name, df in tables.items():
+                self.logger.info(f"Processing table: {table_name}")
+                
+                # Skip empty tables
+                if df.empty:
+                    self.logger.warning(f"Table {table_name} is empty, skipping")
+                    normal_data[table_name] = df
+                    continue
+                
+                # Apply statistical detector if enabled
+                if self.config_manager.get('anomaly_detection.methods.statistical.enabled', True):
+                    statistical_anomalies, df = self.statistical_detector.detect_anomalies(df, table_name)
+                    
+                    if not statistical_anomalies.empty:
+                        if table_name not in anomalies:
+                            anomalies[table_name] = statistical_anomalies
+                        else:
+                            anomalies[table_name] = pd.concat([anomalies[table_name], statistical_anomalies])
+                
+                # Apply rule-based detector if enabled
+                if self.config_manager.get('anomaly_detection.methods.rule_based.enabled', True):
+                    rule_based_anomalies, df = self.rule_based_detector.detect_anomalies(df, table_name)
+                    
+                    if not rule_based_anomalies.empty:
+                        if table_name not in anomalies:
+                            anomalies[table_name] = rule_based_anomalies
+                        else:
+                            anomalies[table_name] = pd.concat([anomalies[table_name], rule_based_anomalies])
+                
+                # Apply clustering detector if enabled
+                if self.config_manager.get('anomaly_detection.methods.clustering.enabled', True):
+                    clustering_anomalies, df = self.clustering_detector.detect_anomalies(df, table_name)
+                    
+                    if not clustering_anomalies.empty:
+                        if table_name not in anomalies:
+                            anomalies[table_name] = clustering_anomalies
+                        else:
+                            anomalies[table_name] = pd.concat([anomalies[table_name], clustering_anomalies])
+                
+                # Store normal data
+                normal_data[table_name] = df
+            
+            # Remove duplicates in anomalies
+            for table_name in anomalies:
+                anomalies[table_name] = anomalies[table_name].drop_duplicates()
+            
+            # Update data
+            result = data.copy()
+            result['anomalies'] = anomalies
+            result['normal_data'] = normal_data
+            
+            # Log summary
+            total_anomalies = sum(len(df) for df in anomalies.values())
+            self.logger.info(f"Detected {total_anomalies} anomalies across {len(anomalies)} tables")
+            
+            return result
         except Exception as e:
-            self.logger.error(f"Error storing anomalies: {str(e)}")
-            # Continue with pipeline
+            self.logger.error(f"Error detecting anomalies: {str(e)}")
+            raise ProcessingError(f"Error detecting anomalies: {str(e)}")
+    
+    def extract_context(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract context for anomalies.
         
-        return input_data
+        Args:
+            data: Input data with detected anomalies.
+        
+        Returns:
+            Updated data with anomaly context.
+        
+        Raises:
+            ProcessingError: If context extraction fails.
+        """
+        self.logger.info("Extracting context for anomalies")
+        
+        try:
+            anomalies = data.get('anomalies', {})
+            tables = data.get('tables', {})
+            relationships = data.get('relationships', [])
+            
+            if not anomalies:
+                self.logger.warning("No anomalies found for context extraction")
+                return data
+            
+            if not relationships:
+                self.logger.warning("No relationships found for context extraction")
+                return data
+            
+            # Convert relationships to dictionaries if needed
+            relationship_dicts = []
+            for r in relationships:
+                if hasattr(r, 'to_dict'):
+                    relationship_dicts.append(r.to_dict())
+                else:
+                    relationship_dicts.append(r)
+            
+            # Store context
+            context = {}
+            
+            # Process each table with anomalies
+            for table_name, anomalies_df in anomalies.items():
+                table_context = self.context_extractor.extract_context(anomalies_df, table_name, tables, relationship_dicts)
+                
+                if table_context:
+                    context[table_name] = table_context
+            
+            # Update data
+            result = data.copy()
+            result['anomaly_context'] = context
+            
+            # Log summary
+            total_context_tables = sum(len(ctx) for ctx in context.values())
+            self.logger.info(f"Extracted context from {total_context_tables} related tables for anomalies")
+            
+            return result
+        except Exception as e:
+            self.logger.error(f"Error extracting context for anomalies: {str(e)}")
+            raise ProcessingError(f"Error extracting context for anomalies: {str(e)}")
+    
+    def save_results(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Save anomaly detection results.
+        
+        Args:
+            data: Input data with detected anomalies and context.
+        
+        Returns:
+            Updated data with saved results.
+        
+        Raises:
+            ProcessingError: If saving results fails.
+        """
+        self.logger.info("Saving anomaly detection results")
+        
+        try:
+            anomalies = data.get('anomalies', {})
+            anomaly_context = data.get('anomaly_context', {})
+            
+            if not anomalies:
+                self.logger.warning("No anomalies found to save")
+                return data
+            
+            # Create output directories
+            anomalies_dir = os.path.join(self.output_dir, 'anomalies')
+            context_dir = os.path.join(self.output_dir, 'context')
+            
+            ensure_directory(anomalies_dir)
+            ensure_directory(context_dir)
+            
+            # Save anomalies
+            anomaly_files = {}
+            for table_name, anomalies_df in anomalies.items():
+                file_path = os.path.join(anomalies_dir, f"{table_name}_anomalies.csv")
+                save_dataframe(anomalies_df, file_path)
+                anomaly_files[table_name] = file_path
+            
+            # Save context
+            context_files = {}
+            for table_name, table_context in anomaly_context.items():
+                table_context_dir = os.path.join(context_dir, table_name)
+                ensure_directory(table_context_dir)
+                
+                table_context_files = {}
+                for related_table, context_df in table_context.items():
+                    file_path = os.path.join(table_context_dir, f"{related_table}_context.csv")
+                    save_dataframe(context_df, file_path)
+                    table_context_files[related_table] = file_path
+                
+                context_files[table_name] = table_context_files
+            
+            # Save summary
+            summary = {
+                'anomaly_counts': {table: len(df) for table, df in anomalies.items()},
+                'context_counts': {table: {related: len(df) for related, df in table_context.items()} for table, table_context in anomaly_context.items()},
+                'anomaly_files': anomaly_files,
+                'context_files': context_files
+            }
+            
+            summary_file = os.path.join(self.output_dir, 'anomaly_detection_summary.json')
+            save_json(summary, summary_file)
+            
+            # Update data
+            result = data.copy()
+            result['anomaly_detection_results'] = {
+                'anomaly_files': anomaly_files,
+                'context_files': context_files,
+                'summary_file': summary_file
+            }
+            
+            self.logger.info("Anomaly detection results saved")
+            return result
+        except Exception as e:
+            self.logger.error(f"Error saving anomaly detection results: {str(e)}")
+            raise ProcessingError(f"Error saving anomaly detection results: {str(e)}")
