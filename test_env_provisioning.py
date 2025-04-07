@@ -1,10 +1,8 @@
 """
-Test Environment Provisioning Module for the Data Warehouse Subsampling Framework.
+Test Environment Provisioning module for the Data Warehouse Subsampling Framework.
 
-This module implements the fifth layer of the data subsampling architecture,
-responsible for using virtualization to minimize storage requirements,
-implementing copy-on-write for efficient environment creation,
-and providing on-demand test environment provisioning.
+This module provides components for creating test environments using
+file-based and database storage options without Docker dependencies.
 """
 
 import os
@@ -12,1217 +10,79 @@ import logging
 import pandas as pd
 import numpy as np
 from typing import Any, Dict, List, Optional, Union, Tuple
-from dataclasses import dataclass
 import json
-from datetime import datetime
+import sqlite3
 import shutil
-import subprocess
-import tempfile
+import datetime
 import uuid
-import docker
-import yaml
+import subprocess
 import time
 
-from ..common.base import Component, ConfigManager, PipelineStep, Pipeline, ProcessingError, ValidationError
+from ..common.base import Component, ConfigManager, Pipeline, PipelineStep, EnvironmentStatus, ProcessingError
+from ..common.utils import save_dataframe, load_dataframe, save_json, load_json, ensure_directory, create_sqlite_database
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class EnvironmentConfig:
-    """Configuration for a test environment."""
-    name: str
-    type: str  # 'docker', 'file', 'database'
-    datasets: List[str]
-    parameters: Dict[str, Any]
-    created_at: datetime = None
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert the environment configuration to a dictionary.
-        
-        Returns:
-            Dictionary representation of the environment configuration.
-        """
-        return {
-            'name': self.name,
-            'type': self.type,
-            'datasets': self.datasets,
-            'parameters': self.parameters,
-            'created_at': self.created_at.isoformat() if self.created_at else None
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'EnvironmentConfig':
-        """Create an EnvironmentConfig from a dictionary.
-        
-        Args:
-            data: Dictionary with environment configuration information.
-        
-        Returns:
-            EnvironmentConfig instance.
-        """
-        created_at = None
-        if data.get('created_at'):
-            try:
-                created_at = datetime.fromisoformat(data['created_at'])
-            except (ValueError, TypeError):
-                created_at = None
-        
-        return cls(
-            name=data.get('name', ''),
-            type=data.get('type', ''),
-            datasets=data.get('datasets', []),
-            parameters=data.get('parameters', {}),
-            created_at=created_at
-        )
-
-
-@dataclass
-class EnvironmentStatus:
-    """Status of a test environment."""
-    name: str
-    status: str  # 'creating', 'running', 'stopped', 'failed'
-    start_time: datetime = None
-    end_time: datetime = None
-    error_message: str = None
-    connection_info: Dict[str, Any] = None
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert the environment status to a dictionary.
-        
-        Returns:
-            Dictionary representation of the environment status.
-        """
-        return {
-            'name': self.name,
-            'status': self.status,
-            'start_time': self.start_time.isoformat() if self.start_time else None,
-            'end_time': self.end_time.isoformat() if self.end_time else None,
-            'error_message': self.error_message,
-            'connection_info': self.connection_info
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'EnvironmentStatus':
-        """Create an EnvironmentStatus from a dictionary.
-        
-        Args:
-            data: Dictionary with environment status information.
-        
-        Returns:
-            EnvironmentStatus instance.
-        """
-        start_time = None
-        if data.get('start_time'):
-            try:
-                start_time = datetime.fromisoformat(data['start_time'])
-            except (ValueError, TypeError):
-                start_time = None
-        
-        end_time = None
-        if data.get('end_time'):
-            try:
-                end_time = datetime.fromisoformat(data['end_time'])
-            except (ValueError, TypeError):
-                end_time = None
-        
-        return cls(
-            name=data.get('name', ''),
-            status=data.get('status', ''),
-            start_time=start_time,
-            end_time=end_time,
-            error_message=data.get('error_message'),
-            connection_info=data.get('connection_info', {})
-        )
-
-
-class EnvironmentManager(Component):
-    """Component for managing test environments."""
+class EnvironmentProvisioner(Component):
+    """Base class for environment provisioners."""
     
     def __init__(self, config_manager: ConfigManager):
-        """Initialize the environment manager.
+        """Initialize the environment provisioner.
         
         Args:
             config_manager: Configuration manager instance.
         """
         super().__init__(config_manager)
-        self.output_dir = None
-        self.environments_dir = None
-        self.environments = {}
     
-    def initialize(self) -> None:
-        """Initialize the environment manager.
-        
-        Raises:
-            ConfigurationError: If the manager cannot be initialized.
-        """
-        # Create output directory
-        self.output_dir = os.path.join(
-            self.config_manager.get('general.output_directory', '/output/dwsf'),
-            'test_env_provisioning'
-        )
-        os.makedirs(self.output_dir, exist_ok=True)
-        
-        # Create environments directory
-        self.environments_dir = os.path.join(self.output_dir, 'environments')
-        os.makedirs(self.environments_dir, exist_ok=True)
-        
-        # Load existing environments
-        self._load_environments()
-        
-        self.logger.info(f"Environment manager initialized with {len(self.environments)} environments")
-    
-    def validate(self) -> bool:
-        """Validate the environment manager configuration and state.
-        
-        Returns:
-            True if the manager is valid, False otherwise.
-        
-        Raises:
-            ValidationError: If validation fails.
-        """
-        if not os.path.exists(self.output_dir):
-            raise ValidationError(f"Output directory does not exist: {self.output_dir}")
-        
-        if not os.path.exists(self.environments_dir):
-            raise ValidationError(f"Environments directory does not exist: {self.environments_dir}")
-        
-        return True
-    
-    def create_environment(self, config: EnvironmentConfig) -> EnvironmentStatus:
-        """Create a new test environment.
+    def provision(self, name: str, datasets: List[str], dataset_data: Dict[str, Dict[str, pd.DataFrame]]) -> EnvironmentStatus:
+        """Provision a test environment.
         
         Args:
-            config: Environment configuration.
+            name: Name of the environment.
+            datasets: List of dataset names to include.
+            dataset_data: Dictionary mapping dataset names to dictionaries mapping table names to DataFrames.
         
         Returns:
-            Status of the created environment.
-        
-        Raises:
-            ProcessingError: If environment creation fails.
+            Environment status.
         """
-        self.logger.info(f"Creating environment '{config.name}' of type '{config.type}'")
-        
-        # Check if environment already exists
-        if config.name in self.environments:
-            raise ProcessingError(f"Environment '{config.name}' already exists")
-        
-        # Create environment directory
-        env_dir = os.path.join(self.environments_dir, config.name)
-        os.makedirs(env_dir, exist_ok=True)
-        
-        # Save configuration
-        config_file = os.path.join(env_dir, 'config.json')
-        with open(config_file, 'w') as f:
-            json.dump(config.to_dict(), f, indent=2)
-        
-        # Create initial status
-        status = EnvironmentStatus(
-            name=config.name,
-            status='creating',
-            start_time=datetime.now()
-        )
-        
-        # Save status
-        status_file = os.path.join(env_dir, 'status.json')
-        with open(status_file, 'w') as f:
-            json.dump(status.to_dict(), f, indent=2)
-        
-        # Add to environments
-        self.environments[config.name] = (config, status)
-        
-        # Create environment based on type
-        try:
-            if config.type == 'docker':
-                status = self._create_docker_environment(config, env_dir)
-            elif config.type == 'file':
-                status = self._create_file_environment(config, env_dir)
-            elif config.type == 'database':
-                status = self._create_database_environment(config, env_dir)
-            else:
-                raise ProcessingError(f"Unsupported environment type: {config.type}")
-            
-            # Update status
-            status.status = 'running'
-            status.end_time = datetime.now()
-            
-            # Save status
-            with open(status_file, 'w') as f:
-                json.dump(status.to_dict(), f, indent=2)
-            
-            # Update environments
-            self.environments[config.name] = (config, status)
-            
-            self.logger.info(f"Environment '{config.name}' created successfully")
-            return status
-        except Exception as e:
-            # Update status
-            status.status = 'failed'
-            status.end_time = datetime.now()
-            status.error_message = str(e)
-            
-            # Save status
-            with open(status_file, 'w') as f:
-                json.dump(status.to_dict(), f, indent=2)
-            
-            # Update environments
-            self.environments[config.name] = (config, status)
-            
-            self.logger.error(f"Error creating environment '{config.name}': {str(e)}")
-            raise ProcessingError(f"Error creating environment '{config.name}': {str(e)}")
+        raise NotImplementedError("Subclasses must implement provision()")
     
-    def get_environment_status(self, name: str) -> EnvironmentStatus:
+    def deprovision(self, name: str) -> EnvironmentStatus:
+        """Deprovision a test environment.
+        
+        Args:
+            name: Name of the environment.
+        
+        Returns:
+            Environment status.
+        """
+        raise NotImplementedError("Subclasses must implement deprovision()")
+    
+    def get_status(self, name: str) -> EnvironmentStatus:
         """Get the status of a test environment.
         
         Args:
             name: Name of the environment.
         
         Returns:
-            Status of the environment.
-        
-        Raises:
-            ProcessingError: If the environment does not exist.
+            Environment status.
         """
-        if name not in self.environments:
-            raise ProcessingError(f"Environment '{name}' does not exist")
-        
-        return self.environments[name][1]
-    
-    def stop_environment(self, name: str) -> EnvironmentStatus:
-        """Stop a test environment.
-        
-        Args:
-            name: Name of the environment.
-        
-        Returns:
-            Status of the environment.
-        
-        Raises:
-            ProcessingError: If the environment does not exist or cannot be stopped.
-        """
-        self.logger.info(f"Stopping environment '{name}'")
-        
-        if name not in self.environments:
-            raise ProcessingError(f"Environment '{name}' does not exist")
-        
-        config, status = self.environments[name]
-        
-        # Check if environment is already stopped
-        if status.status == 'stopped':
-            return status
-        
-        # Stop environment based on type
-        try:
-            if config.type == 'docker':
-                status = self._stop_docker_environment(config, status)
-            elif config.type == 'file':
-                status = self._stop_file_environment(config, status)
-            elif config.type == 'database':
-                status = self._stop_database_environment(config, status)
-            else:
-                raise ProcessingError(f"Unsupported environment type: {config.type}")
-            
-            # Update status
-            status.status = 'stopped'
-            status.end_time = datetime.now()
-            
-            # Save status
-            env_dir = os.path.join(self.environments_dir, name)
-            status_file = os.path.join(env_dir, 'status.json')
-            with open(status_file, 'w') as f:
-                json.dump(status.to_dict(), f, indent=2)
-            
-            # Update environments
-            self.environments[name] = (config, status)
-            
-            self.logger.info(f"Environment '{name}' stopped successfully")
-            return status
-        except Exception as e:
-            # Update status
-            status.status = 'failed'
-            status.end_time = datetime.now()
-            status.error_message = str(e)
-            
-            # Save status
-            env_dir = os.path.join(self.environments_dir, name)
-            status_file = os.path.join(env_dir, 'status.json')
-            with open(status_file, 'w') as f:
-                json.dump(status.to_dict(), f, indent=2)
-            
-            # Update environments
-            self.environments[name] = (config, status)
-            
-            self.logger.error(f"Error stopping environment '{name}': {str(e)}")
-            raise ProcessingError(f"Error stopping environment '{name}': {str(e)}")
-    
-    def delete_environment(self, name: str) -> None:
-        """Delete a test environment.
-        
-        Args:
-            name: Name of the environment.
-        
-        Raises:
-            ProcessingError: If the environment does not exist or cannot be deleted.
-        """
-        self.logger.info(f"Deleting environment '{name}'")
-        
-        if name not in self.environments:
-            raise ProcessingError(f"Environment '{name}' does not exist")
-        
-        config, status = self.environments[name]
-        
-        # Stop environment if running
-        if status.status == 'running':
-            try:
-                self.stop_environment(name)
-            except Exception as e:
-                self.logger.error(f"Error stopping environment '{name}' before deletion: {str(e)}")
-        
-        # Delete environment based on type
-        try:
-            if config.type == 'docker':
-                self._delete_docker_environment(config)
-            elif config.type == 'file':
-                self._delete_file_environment(config)
-            elif config.type == 'database':
-                self._delete_database_environment(config)
-            else:
-                raise ProcessingError(f"Unsupported environment type: {config.type}")
-            
-            # Delete environment directory
-            env_dir = os.path.join(self.environments_dir, name)
-            shutil.rmtree(env_dir, ignore_errors=True)
-            
-            # Remove from environments
-            del self.environments[name]
-            
-            self.logger.info(f"Environment '{name}' deleted successfully")
-        except Exception as e:
-            self.logger.error(f"Error deleting environment '{name}': {str(e)}")
-            raise ProcessingError(f"Error deleting environment '{name}': {str(e)}")
-    
-    def list_environments(self) -> List[Dict[str, Any]]:
-        """List all test environments.
-        
-        Returns:
-            List of environment information dictionaries.
-        """
-        result = []
-        
-        for name, (config, status) in self.environments.items():
-            result.append({
-                'name': name,
-                'type': config.type,
-                'status': status.status,
-                'datasets': config.datasets,
-                'start_time': status.start_time.isoformat() if status.start_time else None,
-                'end_time': status.end_time.isoformat() if status.end_time else None,
-                'connection_info': status.connection_info
-            })
-        
-        return result
-    
-    def _load_environments(self) -> None:
-        """Load existing environments from disk."""
-        self.environments = {}
-        
-        # Get environment directories
-        for env_name in os.listdir(self.environments_dir):
-            env_dir = os.path.join(self.environments_dir, env_name)
-            
-            if not os.path.isdir(env_dir):
-                continue
-            
-            # Load configuration
-            config_file = os.path.join(env_dir, 'config.json')
-            if not os.path.exists(config_file):
-                continue
-            
-            try:
-                with open(config_file, 'r') as f:
-                    config_data = json.load(f)
-                    config = EnvironmentConfig.from_dict(config_data)
-            except Exception as e:
-                self.logger.error(f"Error loading configuration for environment '{env_name}': {str(e)}")
-                continue
-            
-            # Load status
-            status_file = os.path.join(env_dir, 'status.json')
-            if not os.path.exists(status_file):
-                continue
-            
-            try:
-                with open(status_file, 'r') as f:
-                    status_data = json.load(f)
-                    status = EnvironmentStatus.from_dict(status_data)
-            except Exception as e:
-                self.logger.error(f"Error loading status for environment '{env_name}': {str(e)}")
-                continue
-            
-            # Add to environments
-            self.environments[env_name] = (config, status)
-    
-    def _create_docker_environment(self, config: EnvironmentConfig, env_dir: str) -> EnvironmentStatus:
-        """Create a Docker-based test environment.
-        
-        Args:
-            config: Environment configuration.
-            env_dir: Directory for environment files.
-        
-        Returns:
-            Status of the created environment.
-        
-        Raises:
-            ProcessingError: If environment creation fails.
-        """
-        self.logger.info(f"Creating Docker environment '{config.name}'")
-        
-        # Get Docker parameters
-        image = config.parameters.get('image', 'postgres:latest')
-        ports = config.parameters.get('ports', {})
-        environment = config.parameters.get('environment', {})
-        volumes = config.parameters.get('volumes', [])
-        
-        # Create Docker client
-        try:
-            client = docker.from_env()
-        except Exception as e:
-            raise ProcessingError(f"Error creating Docker client: {str(e)}")
-        
-        # Create container
-        try:
-            container = client.containers.run(
-                image=image,
-                name=f"dwsf_{config.name}",
-                ports=ports,
-                environment=environment,
-                volumes=volumes,
-                detach=True
-            )
-            
-            # Wait for container to start
-            time.sleep(5)
-            
-            # Get container info
-            container_info = client.containers.get(container.id).attrs
-            
-            # Create connection info
-            connection_info = {
-                'container_id': container.id,
-                'container_name': container_info['Name'],
-                'ports': {}
-            }
-            
-            # Get port mappings
-            for container_port, host_ports in container_info['NetworkSettings']['Ports'].items():
-                if host_ports:
-                    connection_info['ports'][container_port] = host_ports[0]['HostPort']
-            
-            # Create status
-            status = EnvironmentStatus(
-                name=config.name,
-                status='running',
-                start_time=datetime.now(),
-                connection_info=connection_info
-            )
-            
-            # Load datasets
-            self._load_datasets_to_docker(config, container, connection_info)
-            
-            return status
-        except Exception as e:
-            raise ProcessingError(f"Error creating Docker container: {str(e)}")
-    
-    def _stop_docker_environment(self, config: EnvironmentConfig, status: EnvironmentStatus) -> EnvironmentStatus:
-        """Stop a Docker-based test environment.
-        
-        Args:
-            config: Environment configuration.
-            status: Current environment status.
-        
-        Returns:
-            Updated environment status.
-        
-        Raises:
-            ProcessingError: If environment stopping fails.
-        """
-        self.logger.info(f"Stopping Docker environment '{config.name}'")
-        
-        # Get container ID
-        container_id = status.connection_info.get('container_id')
-        
-        if not container_id:
-            raise ProcessingError(f"Container ID not found for environment '{config.name}'")
-        
-        # Create Docker client
-        try:
-            client = docker.from_env()
-        except Exception as e:
-            raise ProcessingError(f"Error creating Docker client: {str(e)}")
-        
-        # Stop container
-        try:
-            container = client.containers.get(container_id)
-            container.stop()
-            
-            # Update status
-            status.status = 'stopped'
-            status.end_time = datetime.now()
-            
-            return status
-        except Exception as e:
-            raise ProcessingError(f"Error stopping Docker container: {str(e)}")
-    
-    def _delete_docker_environment(self, config: EnvironmentConfig) -> None:
-        """Delete a Docker-based test environment.
-        
-        Args:
-            config: Environment configuration.
-        
-        Raises:
-            ProcessingError: If environment deletion fails.
-        """
-        self.logger.info(f"Deleting Docker environment '{config.name}'")
-        
-        # Create Docker client
-        try:
-            client = docker.from_env()
-        except Exception as e:
-            raise ProcessingError(f"Error creating Docker client: {str(e)}")
-        
-        # Delete container
-        try:
-            container = client.containers.get(f"dwsf_{config.name}")
-            container.remove(force=True)
-        except docker.errors.NotFound:
-            # Container already deleted
-            pass
-        except Exception as e:
-            raise ProcessingError(f"Error deleting Docker container: {str(e)}")
-    
-    def _load_datasets_to_docker(self, config: EnvironmentConfig, container: Any, connection_info: Dict[str, Any]) -> None:
-        """Load datasets to a Docker container.
-        
-        Args:
-            config: Environment configuration.
-            container: Docker container.
-            connection_info: Connection information.
-        
-        Raises:
-            ProcessingError: If dataset loading fails.
-        """
-        self.logger.info(f"Loading datasets to Docker environment '{config.name}'")
-        
-        # Get datasets
-        datasets = config.datasets
-        
-        if not datasets:
-            self.logger.info(f"No datasets to load for environment '{config.name}'")
-            return
-        
-        # Get export paths
-        export_dir = os.path.join(
-            self.config_manager.get('general.output_directory', '/output/dwsf'),
-            'data_integration',
-            'exports'
-        )
-        
-        # Get database parameters
-        db_type = config.parameters.get('db_type', 'postgresql')
-        db_name = config.parameters.get('db_name', 'testdb')
-        db_user = config.parameters.get('db_user', 'postgres')
-        db_password = config.parameters.get('db_password', 'postgres')
-        
-        # Load datasets based on database type
-        for dataset in datasets:
-            dataset_dir = os.path.join(export_dir, dataset)
-            
-            if not os.path.exists(dataset_dir):
-                self.logger.warning(f"Dataset directory not found: {dataset_dir}")
-                continue
-            
-            if db_type == 'postgresql':
-                self._load_dataset_to_postgresql(dataset_dir, container, connection_info, db_name, db_user, db_password)
-            elif db_type == 'mysql':
-                self._load_dataset_to_mysql(dataset_dir, container, connection_info, db_name, db_user, db_password)
-            else:
-                self.logger.warning(f"Unsupported database type: {db_type}")
-    
-    def _load_dataset_to_postgresql(self, dataset_dir: str, container: Any, connection_info: Dict[str, Any],
-                                  db_name: str, db_user: str, db_password: str) -> None:
-        """Load a dataset to a PostgreSQL database in a Docker container.
-        
-        Args:
-            dataset_dir: Directory containing dataset files.
-            container: Docker container.
-            connection_info: Connection information.
-            db_name: Database name.
-            db_user: Database user.
-            db_password: Database password.
-        
-        Raises:
-            ProcessingError: If dataset loading fails.
-        """
-        self.logger.info(f"Loading dataset from {dataset_dir} to PostgreSQL database")
-        
-        # Get CSV files
-        csv_files = [f for f in os.listdir(dataset_dir) if f.endswith('.csv')]
-        
-        if not csv_files:
-            self.logger.warning(f"No CSV files found in dataset directory: {dataset_dir}")
-            return
-        
-        # Create temporary directory for SQL files
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Create SQL files for each table
-            for csv_file in csv_files:
-                table_name = os.path.splitext(csv_file)[0]
-                csv_path = os.path.join(dataset_dir, csv_file)
-                
-                # Read CSV file
-                try:
-                    df = pd.read_csv(csv_path)
-                except Exception as e:
-                    self.logger.error(f"Error reading CSV file {csv_path}: {str(e)}")
-                    continue
-                
-                # Create SQL file
-                sql_path = os.path.join(temp_dir, f"{table_name}.sql")
-                
-                with open(sql_path, 'w') as f:
-                    # Create table
-                    f.write(f"DROP TABLE IF EXISTS {table_name};\n")
-                    f.write(f"CREATE TABLE {table_name} (\n")
-                    
-                    # Add columns
-                    columns = []
-                    for col in df.columns:
-                        # Determine column type
-                        if pd.api.types.is_numeric_dtype(df[col]):
-                            if pd.api.types.is_integer_dtype(df[col]):
-                                col_type = "INTEGER"
-                            else:
-                                col_type = "NUMERIC"
-                        elif pd.api.types.is_datetime64_dtype(df[col]):
-                            col_type = "TIMESTAMP"
-                        elif pd.api.types.is_bool_dtype(df[col]):
-                            col_type = "BOOLEAN"
-                        else:
-                            col_type = "TEXT"
-                        
-                        columns.append(f"    \"{col}\" {col_type}")
-                    
-                    f.write(",\n".join(columns))
-                    f.write("\n);\n\n")
-                    
-                    # Insert data
-                    for _, row in df.iterrows():
-                        values = []
-                        for val in row:
-                            if pd.isna(val):
-                                values.append("NULL")
-                            elif isinstance(val, (int, float)):
-                                values.append(str(val))
-                            elif isinstance(val, bool):
-                                values.append("TRUE" if val else "FALSE")
-                            else:
-                                values.append(f"""'{str(val).replace("'", "''")}'""")
-
-                        
-                        f.write(f"INSERT INTO {table_name} VALUES ({', '.join(values)});\n")
-                
-                # Copy SQL file to container
-                container.exec_run(f"mkdir -p /tmp/dwsf")
-                with open(sql_path, 'rb') as f:
-                    container.put_archive("/tmp/dwsf", f.read())
-                
-                # Execute SQL file
-                container.exec_run(
-                    f"psql -U {db_user} -d {db_name} -f /tmp/dwsf/{table_name}.sql",
-                    environment={"PGPASSWORD": db_password}
-                )
-    
-    def _load_dataset_to_mysql(self, dataset_dir: str, container: Any, connection_info: Dict[str, Any],
-                             db_name: str, db_user: str, db_password: str) -> None:
-        """Load a dataset to a MySQL database in a Docker container.
-        
-        Args:
-            dataset_dir: Directory containing dataset files.
-            container: Docker container.
-            connection_info: Connection information.
-            db_name: Database name.
-            db_user: Database user.
-            db_password: Database password.
-        
-        Raises:
-            ProcessingError: If dataset loading fails.
-        """
-        self.logger.info(f"Loading dataset from {dataset_dir} to MySQL database")
-        
-        # Get CSV files
-        csv_files = [f for f in os.listdir(dataset_dir) if f.endswith('.csv')]
-        
-        if not csv_files:
-            self.logger.warning(f"No CSV files found in dataset directory: {dataset_dir}")
-            return
-        
-        # Create temporary directory for SQL files
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Create SQL files for each table
-            for csv_file in csv_files:
-                table_name = os.path.splitext(csv_file)[0]
-                csv_path = os.path.join(dataset_dir, csv_file)
-                
-                # Read CSV file
-                try:
-                    df = pd.read_csv(csv_path)
-                except Exception as e:
-                    self.logger.error(f"Error reading CSV file {csv_path}: {str(e)}")
-                    continue
-                
-                # Create SQL file
-                sql_path = os.path.join(temp_dir, f"{table_name}.sql")
-                
-                with open(sql_path, 'w') as f:
-                    # Create table
-                    f.write(f"DROP TABLE IF EXISTS {table_name};\n")
-                    f.write(f"CREATE TABLE {table_name} (\n")
-                    
-                    # Add columns
-                    columns = []
-                    for col in df.columns:
-                        # Determine column type
-                        if pd.api.types.is_numeric_dtype(df[col]):
-                            if pd.api.types.is_integer_dtype(df[col]):
-                                col_type = "INT"
-                            else:
-                                col_type = "DOUBLE"
-                        elif pd.api.types.is_datetime64_dtype(df[col]):
-                            col_type = "DATETIME"
-                        elif pd.api.types.is_bool_dtype(df[col]):
-                            col_type = "BOOLEAN"
-                        else:
-                            col_type = "TEXT"
-                        
-                        columns.append(f"    `{col}` {col_type}")
-                    
-                    f.write(",\n".join(columns))
-                    f.write("\n);\n\n")
-                    
-                    # Insert data
-                    for _, row in df.iterrows():
-                        values = []
-                        for val in row:
-                            if pd.isna(val):
-                                values.append("NULL")
-                            elif isinstance(val, (int, float)):
-                                values.append(str(val))
-                            elif isinstance(val, bool):
-                                values.append("1" if val else "0")
-                            else:
-                               values.append(f"""'{str(val).replace("'", "''")}'""")
-
-                        
-                        f.write(f"INSERT INTO {table_name} VALUES ({', '.join(values)});\n")
-                
-                # Copy SQL file to container
-                container.exec_run(f"mkdir -p /tmp/dwsf")
-                with open(sql_path, 'rb') as f:
-                    container.put_archive("/tmp/dwsf", f.read())
-                
-                # Execute SQL file
-                container.exec_run(
-                    f"mysql -u {db_user} -p{db_password} {db_name} < /tmp/dwsf/{table_name}.sql"
-                )
-    
-    def _create_file_environment(self, config: EnvironmentConfig, env_dir: str) -> EnvironmentStatus:
-        """Create a file-based test environment.
-        
-        Args:
-            config: Environment configuration.
-            env_dir: Directory for environment files.
-        
-        Returns:
-            Status of the created environment.
-        
-        Raises:
-            ProcessingError: If environment creation fails.
-        """
-        self.logger.info(f"Creating file environment '{config.name}'")
-        
-        # Get file parameters
-        base_dir = config.parameters.get('base_dir', os.path.join(env_dir, 'data'))
-        
-        # Create data directory
-        os.makedirs(base_dir, exist_ok=True)
-        
-        # Create connection info
-        connection_info = {
-            'base_dir': base_dir
-        }
-        
-        # Create status
-        status = EnvironmentStatus(
-            name=config.name,
-            status='running',
-            start_time=datetime.now(),
-            connection_info=connection_info
-        )
-        
-        # Load datasets
-        self._load_datasets_to_files(config, base_dir)
-        
-        return status
-    
-    def _stop_file_environment(self, config: EnvironmentConfig, status: EnvironmentStatus) -> EnvironmentStatus:
-        """Stop a file-based test environment.
-        
-        Args:
-            config: Environment configuration.
-            status: Current environment status.
-        
-        Returns:
-            Updated environment status.
-        
-        Raises:
-            ProcessingError: If environment stopping fails.
-        """
-        self.logger.info(f"Stopping file environment '{config.name}'")
-        
-        # File environments don't need to be stopped
-        status.status = 'stopped'
-        status.end_time = datetime.now()
-        
-        return status
-    
-    def _delete_file_environment(self, config: EnvironmentConfig) -> None:
-        """Delete a file-based test environment.
-        
-        Args:
-            config: Environment configuration.
-        
-        Raises:
-            ProcessingError: If environment deletion fails.
-        """
-        self.logger.info(f"Deleting file environment '{config.name}'")
-        
-        # Get base directory
-        base_dir = config.parameters.get('base_dir')
-        
-        if base_dir and os.path.exists(base_dir):
-            shutil.rmtree(base_dir, ignore_errors=True)
-    
-    def _load_datasets_to_files(self, config: EnvironmentConfig, base_dir: str) -> None:
-        """Load datasets to a file-based environment.
-        
-        Args:
-            config: Environment configuration.
-            base_dir: Base directory for environment files.
-        
-        Raises:
-            ProcessingError: If dataset loading fails.
-        """
-        self.logger.info(f"Loading datasets to file environment '{config.name}'")
-        
-        # Get datasets
-        datasets = config.datasets
-        
-        if not datasets:
-            self.logger.info(f"No datasets to load for environment '{config.name}'")
-            return
-        
-        # Get export paths
-        export_dir = os.path.join(
-            self.config_manager.get('general.output_directory', '/output/dwsf'),
-            'data_integration',
-            'exports'
-        )
-        
-        # Copy datasets
-        for dataset in datasets:
-            dataset_dir = os.path.join(export_dir, dataset)
-            
-            if not os.path.exists(dataset_dir):
-                self.logger.warning(f"Dataset directory not found: {dataset_dir}")
-                continue
-            
-            # Create dataset directory
-            dataset_output_dir = os.path.join(base_dir, dataset)
-            os.makedirs(dataset_output_dir, exist_ok=True)
-            
-            # Copy files
-            for file_name in os.listdir(dataset_dir):
-                src_path = os.path.join(dataset_dir, file_name)
-                dst_path = os.path.join(dataset_output_dir, file_name)
-                
-                if os.path.isfile(src_path):
-                    shutil.copy2(src_path, dst_path)
-    
-    def _create_database_environment(self, config: EnvironmentConfig, env_dir: str) -> EnvironmentStatus:
-        """Create a database-based test environment.
-        
-        Args:
-            config: Environment configuration.
-            env_dir: Directory for environment files.
-        
-        Returns:
-            Status of the created environment.
-        
-        Raises:
-            ProcessingError: If environment creation fails.
-        """
-        self.logger.info(f"Creating database environment '{config.name}'")
-        
-        # Get database parameters
-        db_type = config.parameters.get('db_type', 'sqlite')
-        db_name = config.parameters.get('db_name', 'testdb')
-        
-        # Create connection info
-        connection_info = {
-            'db_type': db_type,
-            'db_name': db_name
-        }
-        
-        if db_type == 'sqlite':
-            # Create SQLite database
-            db_path = os.path.join(env_dir, f"{db_name}.db")
-            connection_info['db_path'] = db_path
-            
-            # Create database
-            import sqlite3
-            conn = sqlite3.connect(db_path)
-            conn.close()
-            
-            # Load datasets
-            self._load_datasets_to_sqlite(config, db_path)
-        else:
-            raise ProcessingError(f"Unsupported database type: {db_type}")
-        
-        # Create status
-        status = EnvironmentStatus(
-            name=config.name,
-            status='running',
-            start_time=datetime.now(),
-            connection_info=connection_info
-        )
-        
-        return status
-    
-    def _stop_database_environment(self, config: EnvironmentConfig, status: EnvironmentStatus) -> EnvironmentStatus:
-        """Stop a database-based test environment.
-        
-        Args:
-            config: Environment configuration.
-            status: Current environment status.
-        
-        Returns:
-            Updated environment status.
-        
-        Raises:
-            ProcessingError: If environment stopping fails.
-        """
-        self.logger.info(f"Stopping database environment '{config.name}'")
-        
-        # Database environments don't need to be stopped
-        status.status = 'stopped'
-        status.end_time = datetime.now()
-        
-        return status
-    
-    def _delete_database_environment(self, config: EnvironmentConfig) -> None:
-        """Delete a database-based test environment.
-        
-        Args:
-            config: Environment configuration.
-        
-        Raises:
-            ProcessingError: If environment deletion fails.
-        """
-        self.logger.info(f"Deleting database environment '{config.name}'")
-        
-        # Get database parameters
-        db_type = config.parameters.get('db_type', 'sqlite')
-        
-        if db_type == 'sqlite':
-            # Get database path
-            db_path = config.parameters.get('db_path')
-            
-            if db_path and os.path.exists(db_path):
-                os.remove(db_path)
-        else:
-            self.logger.warning(f"Unsupported database type: {db_type}")
-    
-    def _load_datasets_to_sqlite(self, config: EnvironmentConfig, db_path: str) -> None:
-        """Load datasets to a SQLite database.
-        
-        Args:
-            config: Environment configuration.
-            db_path: Path to the SQLite database file.
-        
-        Raises:
-            ProcessingError: If dataset loading fails.
-        """
-        self.logger.info(f"Loading datasets to SQLite database '{db_path}'")
-        
-        # Get datasets
-        datasets = config.datasets
-        
-        if not datasets:
-            self.logger.info(f"No datasets to load for environment '{config.name}'")
-            return
-        
-        # Get export paths
-        export_dir = os.path.join(
-            self.config_manager.get('general.output_directory', '/output/dwsf'),
-            'data_integration',
-            'exports'
-        )
-        
-        # Connect to database
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        
-        try:
-            # Load datasets
-            for dataset in datasets:
-                dataset_dir = os.path.join(export_dir, dataset)
-                
-                if not os.path.exists(dataset_dir):
-                    self.logger.warning(f"Dataset directory not found: {dataset_dir}")
-                    continue
-                
-                # Get CSV files
-                csv_files = [f for f in os.listdir(dataset_dir) if f.endswith('.csv')]
-                
-                if not csv_files:
-                    self.logger.warning(f"No CSV files found in dataset directory: {dataset_dir}")
-                    continue
-                
-                # Load each table
-                for csv_file in csv_files:
-                    table_name = os.path.splitext(csv_file)[0]
-                    csv_path = os.path.join(dataset_dir, csv_file)
-                    
-                    # Read CSV file
-                    try:
-                        df = pd.read_csv(csv_path)
-                    except Exception as e:
-                        self.logger.error(f"Error reading CSV file {csv_path}: {str(e)}")
-                        continue
-                    
-                    # Write to SQLite
-                    df.to_sql(table_name, conn, if_exists='replace', index=False)
-        finally:
-            conn.close()
+        raise NotImplementedError("Subclasses must implement get_status()")
 
 
-class DockerEnvironmentProvisioner(Component):
-    """Component for provisioning Docker-based test environments."""
+class FileEnvironmentProvisioner(EnvironmentProvisioner):
+    """Provisioner for file-based test environments."""
     
-    def __init__(self, config_manager: ConfigManager, environment_manager: EnvironmentManager):
-        """Initialize the Docker environment provisioner.
-        
-        Args:
-            config_manager: Configuration manager instance.
-            environment_manager: EnvironmentManager instance.
-        """
-        super().__init__(config_manager)
-        self.environment_manager = environment_manager
-        self.docker_config = None
-    
-    def initialize(self) -> None:
-        """Initialize the Docker environment provisioner.
-        
-        Raises:
-            ConfigurationError: If the provisioner cannot be initialized.
-        """
-        # Get Docker configuration
-        self.docker_config = self.config_manager.get('test_env_provisioning.docker', {})
-        
-        self.logger.info("Docker environment provisioner initialized")
-    
-    def validate(self) -> bool:
-        """Validate the Docker environment provisioner configuration and state.
-        
-        Returns:
-            True if the provisioner is valid, False otherwise.
-        
-        Raises:
-            ValidationError: If validation fails.
-        """
-        # Check if Docker is available
-        try:
-            client = docker.from_env()
-            client.ping()
-        except Exception as e:
-            raise ValidationError(f"Docker is not available: {str(e)}")
-        
-        return True
-    
-    def provision(self, name: str, datasets: List[str]) -> EnvironmentStatus:
-        """Provision a Docker-based test environment.
-        
-        Args:
-            name: Name of the environment.
-            datasets: List of dataset names to include.
-        
-        Returns:
-            Status of the provisioned environment.
-        
-        Raises:
-            ProcessingError: If provisioning fails.
-        """
-        self.logger.info(f"Provisioning Docker environment '{name}' with datasets {datasets}")
-        
-        # Get Docker parameters
-        image = self.docker_config.get('image', 'postgres:latest')
-        ports = self.docker_config.get('ports', {'5432/tcp': None})
-        environment = self.docker_config.get('environment', {
-            'POSTGRES_USER': 'postgres',
-            'POSTGRES_PASSWORD': 'postgres',
-            'POSTGRES_DB': 'testdb'
-        })
-        volumes = self.docker_config.get('volumes', [])
-        
-        # Create environment configuration
-        config = EnvironmentConfig(
-            name=name,
-            type='docker',
-            datasets=datasets,
-            parameters={
-                'image': image,
-                'ports': ports,
-                'environment': environment,
-                'volumes': volumes,
-                'db_type': 'postgresql',
-                'db_name': environment.get('POSTGRES_DB', 'testdb'),
-                'db_user': environment.get('POSTGRES_USER', 'postgres'),
-                'db_password': environment.get('POSTGRES_PASSWORD', 'postgres')
-            },
-            created_at=datetime.now()
-        )
-        
-        # Create environment
-        try:
-            status = self.environment_manager.create_environment(config)
-            return status
-        except Exception as e:
-            raise ProcessingError(f"Error provisioning Docker environment: {str(e)}")
-
-
-class FileEnvironmentProvisioner(Component):
-    """Component for provisioning file-based test environments."""
-    
-    def __init__(self, config_manager: ConfigManager, environment_manager: EnvironmentManager):
+    def __init__(self, config_manager: ConfigManager):
         """Initialize the file environment provisioner.
         
         Args:
             config_manager: Configuration manager instance.
-            environment_manager: EnvironmentManager instance.
         """
         super().__init__(config_manager)
-        self.environment_manager = environment_manager
-        self.file_config = None
+        self.base_dir = None
+        self.file_format = None
     
     def initialize(self) -> None:
         """Initialize the file environment provisioner.
@@ -1230,84 +90,207 @@ class FileEnvironmentProvisioner(Component):
         Raises:
             ConfigurationError: If the provisioner cannot be initialized.
         """
-        # Get file configuration
-        self.file_config = self.config_manager.get('test_env_provisioning.file', {})
+        self.base_dir = self.config_manager.get('test_env_provisioning.file.base_dir', 'environments/file')
+        self.file_format = self.config_manager.get('test_env_provisioning.file.format', 'csv')
         
-        self.logger.info("File environment provisioner initialized")
+        # Create base directory
+        ensure_directory(self.base_dir)
+        
+        self.logger.info(f"File environment provisioner initialized with base directory: {self.base_dir}")
     
-    def validate(self) -> bool:
-        """Validate the file environment provisioner configuration and state.
-        
-        Returns:
-            True if the provisioner is valid, False otherwise.
-        
-        Raises:
-            ValidationError: If validation fails.
-        """
-        return True
-    
-    def provision(self, name: str, datasets: List[str]) -> EnvironmentStatus:
+    def provision(self, name: str, datasets: List[str], dataset_data: Dict[str, Dict[str, pd.DataFrame]]) -> EnvironmentStatus:
         """Provision a file-based test environment.
         
         Args:
             name: Name of the environment.
             datasets: List of dataset names to include.
+            dataset_data: Dictionary mapping dataset names to dictionaries mapping table names to DataFrames.
         
         Returns:
-            Status of the provisioned environment.
-        
-        Raises:
-            ProcessingError: If provisioning fails.
+            Environment status.
         """
-        env_dir = os.path.join(self.output_dir, name)
-        os.makedirs(env_dir, exist_ok=True)
-        self.logger.info(f"Provisioning file environment '{name}' with datasets {datasets}")
+        self.logger.info(f"Provisioning file environment: {name}")
         
-        # Get file parameters
-        base_dir = self.file_config.get('base_dir')
-        
-        if not base_dir:
-            # Use default base directory
-            base_dir = os.path.join(
-                self.config_manager.get('general.output_directory', '/output/dwsf'),
-                'test_env_provisioning',
-                'environments',
-                name,
-                'data'
-            )
-        
-        # Create environment configuration
-        config = EnvironmentConfig(
-            name=name,
-            type='file',
-            datasets=datasets,
-            parameters={
-                'base_dir': base_dir
-            },
-            created_at=datetime.now()
-        )
-        
-        # Create environment
         try:
-            status = self.environment_manager.create_environment(config)
-            return status
+            # Create environment directory
+            env_dir = os.path.join(self.base_dir, name)
+            ensure_directory(env_dir)
+            
+            # Save datasets
+            dataset_files = {}
+            
+            for dataset_name in datasets:
+                if dataset_name not in dataset_data:
+                    self.logger.warning(f"Dataset {dataset_name} not found, skipping")
+                    continue
+                
+                # Create dataset directory
+                dataset_dir = os.path.join(env_dir, dataset_name)
+                ensure_directory(dataset_dir)
+                
+                # Save tables
+                table_files = {}
+                
+                for table_name, df in dataset_data[dataset_name].items():
+                    if self.file_format == 'csv':
+                        file_path = os.path.join(dataset_dir, f"{table_name}.csv")
+                        df.to_csv(file_path, index=False)
+                    elif self.file_format == 'parquet':
+                        file_path = os.path.join(dataset_dir, f"{table_name}.parquet")
+                        df.to_parquet(file_path, index=False)
+                    elif self.file_format == 'json':
+                        file_path = os.path.join(dataset_dir, f"{table_name}.json")
+                        df.to_json(file_path, orient='records', lines=True)
+                    else:
+                        file_path = os.path.join(dataset_dir, f"{table_name}.csv")
+                        df.to_csv(file_path, index=False)
+                    
+                    table_files[table_name] = file_path
+                
+                dataset_files[dataset_name] = table_files
+            
+            # Create metadata file
+            metadata = {
+                'name': name,
+                'type': 'file',
+                'datasets': datasets,
+                'created_at': datetime.datetime.now().isoformat(),
+                'status': 'running',
+                'dataset_files': dataset_files
+            }
+            
+            metadata_path = os.path.join(env_dir, 'metadata.json')
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            # Return environment status
+            return EnvironmentStatus(
+                name=name,
+                status='running',
+                connection_info={
+                    'type': 'file',
+                    'base_dir': env_dir,
+                    'datasets': datasets,
+                    'dataset_files': dataset_files
+                }
+            )
         except Exception as e:
-            raise ProcessingError(f"Error provisioning file environment: {str(e)}")
-
-
-class DatabaseEnvironmentProvisioner(Component):
-    """Component for provisioning database-based test environments."""
+            self.logger.error(f"Error provisioning file environment {name}: {str(e)}")
+            return EnvironmentStatus(
+                name=name,
+                status='failed',
+                error=str(e)
+            )
     
-    def __init__(self, config_manager: ConfigManager, environment_manager: EnvironmentManager):
+    def deprovision(self, name: str) -> EnvironmentStatus:
+        """Deprovision a file-based test environment.
+        
+        Args:
+            name: Name of the environment.
+        
+        Returns:
+            Environment status.
+        """
+        self.logger.info(f"Deprovisioning file environment: {name}")
+        
+        try:
+            # Get environment directory
+            env_dir = os.path.join(self.base_dir, name)
+            
+            if not os.path.exists(env_dir):
+                self.logger.warning(f"Environment directory not found: {env_dir}")
+                return EnvironmentStatus(
+                    name=name,
+                    status='stopped',
+                    error=f"Environment directory not found: {env_dir}"
+                )
+            
+            # Remove environment directory
+            shutil.rmtree(env_dir)
+            
+            # Return environment status
+            return EnvironmentStatus(
+                name=name,
+                status='stopped'
+            )
+        except Exception as e:
+            self.logger.error(f"Error deprovisioning file environment {name}: {str(e)}")
+            return EnvironmentStatus(
+                name=name,
+                status='failed',
+                error=str(e)
+            )
+    
+    def get_status(self, name: str) -> EnvironmentStatus:
+        """Get the status of a file-based test environment.
+        
+        Args:
+            name: Name of the environment.
+        
+        Returns:
+            Environment status.
+        """
+        self.logger.info(f"Getting status of file environment: {name}")
+        
+        try:
+            # Get environment directory
+            env_dir = os.path.join(self.base_dir, name)
+            
+            if not os.path.exists(env_dir):
+                self.logger.warning(f"Environment directory not found: {env_dir}")
+                return EnvironmentStatus(
+                    name=name,
+                    status='stopped',
+                    error=f"Environment directory not found: {env_dir}"
+                )
+            
+            # Get metadata file
+            metadata_path = os.path.join(env_dir, 'metadata.json')
+            
+            if not os.path.exists(metadata_path):
+                self.logger.warning(f"Metadata file not found: {metadata_path}")
+                return EnvironmentStatus(
+                    name=name,
+                    status='unknown',
+                    error=f"Metadata file not found: {metadata_path}"
+                )
+            
+            # Read metadata
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            
+            # Return environment status
+            return EnvironmentStatus(
+                name=name,
+                status=metadata.get('status', 'unknown'),
+                connection_info={
+                    'type': 'file',
+                    'base_dir': env_dir,
+                    'datasets': metadata.get('datasets', []),
+                    'dataset_files': metadata.get('dataset_files', {})
+                }
+            )
+        except Exception as e:
+            self.logger.error(f"Error getting status of file environment {name}: {str(e)}")
+            return EnvironmentStatus(
+                name=name,
+                status='unknown',
+                error=str(e)
+            )
+
+
+class DatabaseEnvironmentProvisioner(EnvironmentProvisioner):
+    """Provisioner for database test environments."""
+    
+    def __init__(self, config_manager: ConfigManager):
         """Initialize the database environment provisioner.
         
         Args:
             config_manager: Configuration manager instance.
-            environment_manager: EnvironmentManager instance.
         """
         super().__init__(config_manager)
-        self.environment_manager = environment_manager
-        self.database_config = None
+        self.base_dir = None
+        self.db_type = None
     
     def initialize(self) -> None:
         """Initialize the database environment provisioner.
@@ -1315,59 +298,815 @@ class DatabaseEnvironmentProvisioner(Component):
         Raises:
             ConfigurationError: If the provisioner cannot be initialized.
         """
-        # Get database configuration
-        self.database_config = self.config_manager.get('test_env_provisioning.database', {})
+        self.base_dir = self.config_manager.get('test_env_provisioning.database.base_dir', 'environments/database')
+        self.db_type = self.config_manager.get('test_env_provisioning.database.db_type', 'sqlite')
         
-        self.logger.info("Database environment provisioner initialized")
+        # Create base directory
+        ensure_directory(self.base_dir)
+        
+        self.logger.info(f"Database environment provisioner initialized with base directory: {self.base_dir}")
     
-    def validate(self) -> bool:
-        """Validate the database environment provisioner configuration and state.
-        
-        Returns:
-            True if the provisioner is valid, False otherwise.
-        
-        Raises:
-            ValidationError: If validation fails.
-        """
-        return True
-    
-    def provision(self, name: str, datasets: List[str]) -> EnvironmentStatus:
-        """Provision a database-based test environment.
+    def provision(self, name: str, datasets: List[str], dataset_data: Dict[str, Dict[str, pd.DataFrame]]) -> EnvironmentStatus:
+        """Provision a database test environment.
         
         Args:
             name: Name of the environment.
             datasets: List of dataset names to include.
+            dataset_data: Dictionary mapping dataset names to dictionaries mapping table names to DataFrames.
         
         Returns:
-            Status of the provisioned environment.
+            Environment status.
+        """
+        self.logger.info(f"Provisioning database environment: {name}")
+        
+        try:
+            # Create environment directory
+            env_dir = os.path.join(self.base_dir, name)
+            ensure_directory(env_dir)
+            
+            # Create database
+            if self.db_type == 'sqlite':
+                # Create SQLite database
+                db_path = os.path.join(env_dir, f"{name}.db")
+                
+                # Combine all datasets into a single dictionary
+                all_tables = {}
+                for dataset_name in datasets:
+                    if dataset_name not in dataset_data:
+                        self.logger.warning(f"Dataset {dataset_name} not found, skipping")
+                        continue
+                    
+                    # Add dataset prefix to table names to avoid conflicts
+                    for table_name, df in dataset_data[dataset_name].items():
+                        all_tables[f"{dataset_name}_{table_name}"] = df
+                
+                # Create database
+                conn = sqlite3.connect(db_path)
+                
+                for table_name, df in all_tables.items():
+                    df.to_sql(table_name, conn, if_exists='replace', index=False)
+                
+                conn.close()
+                
+                # Create metadata file
+                metadata = {
+                    'name': name,
+                    'type': 'database',
+                    'db_type': 'sqlite',
+                    'datasets': datasets,
+                    'created_at': datetime.datetime.now().isoformat(),
+                    'status': 'running',
+                    'db_path': db_path,
+                    'tables': list(all_tables.keys())
+                }
+                
+                metadata_path = os.path.join(env_dir, 'metadata.json')
+                with open(metadata_path, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+                
+                # Return environment status
+                return EnvironmentStatus(
+                    name=name,
+                    status='running',
+                    connection_info={
+                        'type': 'database',
+                        'db_type': 'sqlite',
+                        'db_path': db_path,
+                        'tables': list(all_tables.keys())
+                    }
+                )
+            elif self.db_type == 'in-memory':
+                # Create in-memory database (for testing purposes)
+                # Note: This is not persistent and will be lost when the process ends
+                
+                # Combine all datasets into a single dictionary
+                all_tables = {}
+                for dataset_name in datasets:
+                    if dataset_name not in dataset_data:
+                        self.logger.warning(f"Dataset {dataset_name} not found, skipping")
+                        continue
+                    
+                    # Add dataset prefix to table names to avoid conflicts
+                    for table_name, df in dataset_data[dataset_name].items():
+                        all_tables[f"{dataset_name}_{table_name}"] = df
+                
+                # Create metadata file
+                metadata = {
+                    'name': name,
+                    'type': 'database',
+                    'db_type': 'in-memory',
+                    'datasets': datasets,
+                    'created_at': datetime.datetime.now().isoformat(),
+                    'status': 'running',
+                    'tables': list(all_tables.keys())
+                }
+                
+                metadata_path = os.path.join(env_dir, 'metadata.json')
+                with open(metadata_path, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+                
+                # Return environment status
+                return EnvironmentStatus(
+                    name=name,
+                    status='running',
+                    connection_info={
+                        'type': 'database',
+                        'db_type': 'in-memory',
+                        'tables': list(all_tables.keys())
+                    }
+                )
+            else:
+                self.logger.error(f"Unsupported database type: {self.db_type}")
+                return EnvironmentStatus(
+                    name=name,
+                    status='failed',
+                    error=f"Unsupported database type: {self.db_type}"
+                )
+        except Exception as e:
+            self.logger.error(f"Error provisioning database environment {name}: {str(e)}")
+            return EnvironmentStatus(
+                name=name,
+                status='failed',
+                error=str(e)
+            )
+    
+    def deprovision(self, name: str) -> EnvironmentStatus:
+        """Deprovision a database test environment.
+        
+        Args:
+            name: Name of the environment.
+        
+        Returns:
+            Environment status.
+        """
+        self.logger.info(f"Deprovisioning database environment: {name}")
+        
+        try:
+            # Get environment directory
+            env_dir = os.path.join(self.base_dir, name)
+            
+            if not os.path.exists(env_dir):
+                self.logger.warning(f"Environment directory not found: {env_dir}")
+                return EnvironmentStatus(
+                    name=name,
+                    status='stopped',
+                    error=f"Environment directory not found: {env_dir}"
+                )
+            
+            # Remove environment directory
+            shutil.rmtree(env_dir)
+            
+            # Return environment status
+            return EnvironmentStatus(
+                name=name,
+                status='stopped'
+            )
+        except Exception as e:
+            self.logger.error(f"Error deprovisioning database environment {name}: {str(e)}")
+            return EnvironmentStatus(
+                name=name,
+                status='failed',
+                error=str(e)
+            )
+    
+    def get_status(self, name: str) -> EnvironmentStatus:
+        """Get the status of a database test environment.
+        
+        Args:
+            name: Name of the environment.
+        
+        Returns:
+            Environment status.
+        """
+        self.logger.info(f"Getting status of database environment: {name}")
+        
+        try:
+            # Get environment directory
+            env_dir = os.path.join(self.base_dir, name)
+            
+            if not os.path.exists(env_dir):
+                self.logger.warning(f"Environment directory not found: {env_dir}")
+                return EnvironmentStatus(
+                    name=name,
+                    status='stopped',
+                    error=f"Environment directory not found: {env_dir}"
+                )
+            
+            # Get metadata file
+            metadata_path = os.path.join(env_dir, 'metadata.json')
+            
+            if not os.path.exists(metadata_path):
+                self.logger.warning(f"Metadata file not found: {metadata_path}")
+                return EnvironmentStatus(
+                    name=name,
+                    status='unknown',
+                    error=f"Metadata file not found: {metadata_path}"
+                )
+            
+            # Read metadata
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            
+            # Check database
+            if metadata.get('db_type') == 'sqlite':
+                db_path = metadata.get('db_path')
+                
+                if not os.path.exists(db_path):
+                    self.logger.warning(f"Database file not found: {db_path}")
+                    return EnvironmentStatus(
+                        name=name,
+                        status='failed',
+                        error=f"Database file not found: {db_path}"
+                    )
+                
+                # Test database connection
+                try:
+                    conn = sqlite3.connect(db_path)
+                    conn.close()
+                except Exception as e:
+                    self.logger.warning(f"Error connecting to database: {str(e)}")
+                    return EnvironmentStatus(
+                        name=name,
+                        status='failed',
+                        error=f"Error connecting to database: {str(e)}"
+                    )
+            
+            # Return environment status
+            return EnvironmentStatus(
+                name=name,
+                status=metadata.get('status', 'unknown'),
+                connection_info={
+                    'type': 'database',
+                    'db_type': metadata.get('db_type'),
+                    'db_path': metadata.get('db_path') if metadata.get('db_type') == 'sqlite' else None,
+                    'tables': metadata.get('tables', [])
+                }
+            )
+        except Exception as e:
+            self.logger.error(f"Error getting status of database environment {name}: {str(e)}")
+            return EnvironmentStatus(
+                name=name,
+                status='unknown',
+                error=str(e)
+            )
+
+
+class NativeProcessEnvironmentProvisioner(EnvironmentProvisioner):
+    """Provisioner for native process test environments."""
+    
+    def __init__(self, config_manager: ConfigManager):
+        """Initialize the native process environment provisioner.
+        
+        Args:
+            config_manager: Configuration manager instance.
+        """
+        super().__init__(config_manager)
+        self.base_dir = None
+        self.processes = {}
+    
+    def initialize(self) -> None:
+        """Initialize the native process environment provisioner.
         
         Raises:
-            ProcessingError: If provisioning fails.
+            ConfigurationError: If the provisioner cannot be initialized.
         """
-        self.logger.info(f"Provisioning database environment '{name}' with datasets {datasets}")
+        self.base_dir = self.config_manager.get('test_env_provisioning.native_process.base_dir', 'environments/native_process')
         
-        # Get database parameters
-        db_type = self.database_config.get('db_type', 'sqlite')
-        db_name = self.database_config.get('db_name', 'testdb')
+        # Create base directory
+        ensure_directory(self.base_dir)
         
-        # Create environment configuration
-        config = EnvironmentConfig(
-            name=name,
-            type='database',
-            datasets=datasets,
-            parameters={
-                'db_type': db_type,
-                'db_name': db_name
-            },
-            created_at=datetime.now()
-        )
+        self.logger.info(f"Native process environment provisioner initialized with base directory: {self.base_dir}")
+    
+    def provision(self, name: str, datasets: List[str], dataset_data: Dict[str, Dict[str, pd.DataFrame]]) -> EnvironmentStatus:
+        """Provision a native process test environment.
         
-        # Create environment
+        Args:
+            name: Name of the environment.
+            datasets: List of dataset names to include.
+            dataset_data: Dictionary mapping dataset names to dictionaries mapping table names to DataFrames.
+        
+        Returns:
+            Environment status.
+        """
+        self.logger.info(f"Provisioning native process environment: {name}")
+        
         try:
-            status = self.environment_manager.create_environment(config)
-            return status
+            # Create environment directory
+            env_dir = os.path.join(self.base_dir, name)
+            ensure_directory(env_dir)
+            
+            # Create data directory
+            data_dir = os.path.join(env_dir, 'data')
+            ensure_directory(data_dir)
+            
+            # Save datasets as CSV files
+            dataset_files = {}
+            
+            for dataset_name in datasets:
+                if dataset_name not in dataset_data:
+                    self.logger.warning(f"Dataset {dataset_name} not found, skipping")
+                    continue
+                
+                # Create dataset directory
+                dataset_dir = os.path.join(data_dir, dataset_name)
+                ensure_directory(dataset_dir)
+                
+                # Save tables
+                table_files = {}
+                
+                for table_name, df in dataset_data[dataset_name].items():
+                    file_path = os.path.join(dataset_dir, f"{table_name}.csv")
+                    df.to_csv(file_path, index=False)
+                    table_files[table_name] = file_path
+                
+                dataset_files[dataset_name] = table_files
+            
+            # Create SQLite database
+            db_path = os.path.join(env_dir, f"{name}.db")
+            
+            # Combine all datasets into a single dictionary
+            all_tables = {}
+            for dataset_name in datasets:
+                if dataset_name not in dataset_data:
+                    continue
+                
+                # Add dataset prefix to table names to avoid conflicts
+                for table_name, df in dataset_data[dataset_name].items():
+                    all_tables[f"{dataset_name}_{table_name}"] = df
+            
+            # Create database
+            conn = sqlite3.connect(db_path)
+            
+            for table_name, df in all_tables.items():
+                df.to_sql(table_name, conn, if_exists='replace', index=False)
+            
+            conn.close()
+            
+            # Create a simple Python HTTP server script
+            server_script = os.path.join(env_dir, 'server.py')
+            with open(server_script, 'w') as f:
+                f.write("""
+import http.server
+import socketserver
+import sqlite3
+import json
+import os
+import sys
+from urllib.parse import urlparse, parse_qs
+
+# Get port from command line or use default
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+
+# Get database path from environment
+DB_PATH = os.environ.get('DB_PATH', 'environment.db')
+
+class TestEnvironmentHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        parsed_path = urlparse(self.path)
+        
+        # Serve static files
+        if parsed_path.path.startswith('/data/'):
+            return super().do_GET()
+        
+        # API endpoints
+        if parsed_path.path == '/api/tables':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            
+            # Get list of tables from database
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            
+            self.wfile.write(json.dumps({'tables': tables}).encode())
+            return
+        
+        if parsed_path.path.startswith('/api/table/'):
+            table_name = parsed_path.path.replace('/api/table/', '')
+            
+            # Get query parameters
+            params = parse_qs(parsed_path.query)
+            limit = int(params.get('limit', ['100'])[0])
+            offset = int(params.get('offset', ['0'])[0])
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            
+            # Get table data from database
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute(f"SELECT * FROM '{table_name}' LIMIT ? OFFSET ?", (limit, offset))
+                columns = [description[0] for description in cursor.description]
+                rows = cursor.fetchall()
+                
+                result = {
+                    'columns': columns,
+                    'rows': rows,
+                    'total': cursor.execute(f"SELECT COUNT(*) FROM '{table_name}'").fetchone()[0]
+                }
+                
+                self.wfile.write(json.dumps(result).encode())
+            except sqlite3.Error as e:
+                self.wfile.write(json.dumps({'error': str(e)}).encode())
+            
+            conn.close()
+            return
+        
+        # Default: serve index.html
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        
+        index_html = '''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Test Environment</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                h1 { color: #333; }
+                table { border-collapse: collapse; width: 100%; }
+                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+                th { background-color: #f2f2f2; }
+                tr:nth-child(even) { background-color: #f9f9f9; }
+                .table-selector { margin-bottom: 20px; }
+            </style>
+        </head>
+        <body>
+            <h1>Test Environment</h1>
+            <div class="table-selector">
+                <label for="table-select">Select Table:</label>
+                <select id="table-select" onchange="loadTable()"></select>
+            </div>
+            <div id="table-container">
+                <table id="data-table">
+                    <thead>
+                        <tr id="table-header"></tr>
+                    </thead>
+                    <tbody id="table-body"></tbody>
+                </table>
+            </div>
+            
+            <script>
+                // Load tables on page load
+                window.onload = function() {
+                    fetch('/api/tables')
+                        .then(response => response.json())
+                        .then(data => {
+                            const select = document.getElementById('table-select');
+                            data.tables.forEach(table => {
+                                const option = document.createElement('option');
+                                option.value = table;
+                                option.textContent = table;
+                                select.appendChild(option);
+                            });
+                            
+                            if (data.tables.length > 0) {
+                                loadTable();
+                            }
+                        });
+                };
+                
+                // Load selected table data
+                function loadTable() {
+                    const tableName = document.getElementById('table-select').value;
+                    
+                    fetch(`/api/table/${tableName}?limit=100&offset=0`)
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data.error) {
+                                console.error(data.error);
+                                return;
+                            }
+                            
+                            // Set header
+                            const header = document.getElementById('table-header');
+                            header.innerHTML = '';
+                            data.columns.forEach(column => {
+                                const th = document.createElement('th');
+                                th.textContent = column;
+                                header.appendChild(th);
+                            });
+                            
+                            // Set body
+                            const body = document.getElementById('table-body');
+                            body.innerHTML = '';
+                            data.rows.forEach(row => {
+                                const tr = document.createElement('tr');
+                                row.forEach(cell => {
+                                    const td = document.createElement('td');
+                                    td.textContent = cell;
+                                    tr.appendChild(td);
+                                });
+                                body.appendChild(tr);
+                            });
+                        });
+                }
+            </script>
+        </body>
+        </html>
+        '''
+        
+        self.wfile.write(index_html.encode())
+
+# Set up the server
+Handler = TestEnvironmentHandler
+httpd = socketserver.TCPServer(("", PORT), Handler)
+
+print(f"Serving at port {PORT}")
+print(f"Using database: {DB_PATH}")
+print(f"Access the environment at http://localhost:{PORT}")
+
+# Serve until process is killed
+httpd.serve_forever()
+                """)
+            
+            # Create a start script
+            start_script = os.path.join(env_dir, 'start.sh')
+            with open(start_script, 'w') as f:
+                f.write(f"""#!/bin/bash
+export DB_PATH="{db_path}"
+cd "{env_dir}"
+python3 server.py 8000
+                """)
+            
+            # Make the start script executable
+            os.chmod(start_script, 0o755)
+            
+            # Start the server process
+            process = subprocess.Popen(
+                ['bash', start_script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=env_dir
+            )
+            
+            # Store the process
+            self.processes[name] = process
+            
+            # Wait for the server to start
+            time.sleep(2)
+            
+            # Check if the process is still running
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                self.logger.error(f"Server process failed to start: {stderr.decode()}")
+                return EnvironmentStatus(
+                    name=name,
+                    status='failed',
+                    error=f"Server process failed to start: {stderr.decode()}"
+                )
+            
+            # Create metadata file
+            metadata = {
+                'name': name,
+                'type': 'native_process',
+                'datasets': datasets,
+                'created_at': datetime.datetime.now().isoformat(),
+                'status': 'running',
+                'db_path': db_path,
+                'server_script': server_script,
+                'start_script': start_script,
+                'port': 8000,
+                'pid': process.pid
+            }
+            
+            metadata_path = os.path.join(env_dir, 'metadata.json')
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            # Return environment status
+            return EnvironmentStatus(
+                name=name,
+                status='running',
+                connection_info={
+                    'type': 'native_process',
+                    'url': 'http://localhost:8000',
+                    'port': 8000,
+                    'db_path': db_path,
+                    'pid': process.pid
+                }
+            )
         except Exception as e:
-            raise ProcessingError(f"Error provisioning database environment: {str(e)}")
+            self.logger.error(f"Error provisioning native process environment {name}: {str(e)}")
+            return EnvironmentStatus(
+                name=name,
+                status='failed',
+                error=str(e)
+            )
+    
+    def deprovision(self, name: str) -> EnvironmentStatus:
+        """Deprovision a native process test environment.
+        
+        Args:
+            name: Name of the environment.
+        
+        Returns:
+            Environment status.
+        """
+        self.logger.info(f"Deprovisioning native process environment: {name}")
+        
+        try:
+            # Stop the process
+            if name in self.processes:
+                process = self.processes[name]
+                
+                if process.poll() is None:  # Process is still running
+                    process.terminate()
+                    process.wait(timeout=5)
+                
+                del self.processes[name]
+            
+            # Get environment directory
+            env_dir = os.path.join(self.base_dir, name)
+            
+            if not os.path.exists(env_dir):
+                self.logger.warning(f"Environment directory not found: {env_dir}")
+                return EnvironmentStatus(
+                    name=name,
+                    status='stopped',
+                    error=f"Environment directory not found: {env_dir}"
+                )
+            
+            # Get metadata file
+            metadata_path = os.path.join(env_dir, 'metadata.json')
+            
+            if os.path.exists(metadata_path):
+                # Read metadata
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                
+                # Kill the process if it's still running
+                pid = metadata.get('pid')
+                if pid:
+                    try:
+                        os.kill(pid, 0)  # Check if process exists
+                        os.kill(pid, 15)  # SIGTERM
+                    except OSError:
+                        pass  # Process doesn't exist
+            
+            # Remove environment directory
+            shutil.rmtree(env_dir)
+            
+            # Return environment status
+            return EnvironmentStatus(
+                name=name,
+                status='stopped'
+            )
+        except Exception as e:
+            self.logger.error(f"Error deprovisioning native process environment {name}: {str(e)}")
+            return EnvironmentStatus(
+                name=name,
+                status='failed',
+                error=str(e)
+            )
+    
+    def get_status(self, name: str) -> EnvironmentStatus:
+        """Get the status of a native process test environment.
+        
+        Args:
+            name: Name of the environment.
+        
+        Returns:
+            Environment status.
+        """
+        self.logger.info(f"Getting status of native process environment: {name}")
+        
+        try:
+            # Check if process is running
+            if name in self.processes:
+                process = self.processes[name]
+                
+                if process.poll() is None:  # Process is still running
+                    # Get environment directory
+                    env_dir = os.path.join(self.base_dir, name)
+                    
+                    if not os.path.exists(env_dir):
+                        self.logger.warning(f"Environment directory not found: {env_dir}")
+                        return EnvironmentStatus(
+                            name=name,
+                            status='unknown',
+                            error=f"Environment directory not found: {env_dir}"
+                        )
+                    
+                    # Get metadata file
+                    metadata_path = os.path.join(env_dir, 'metadata.json')
+                    
+                    if not os.path.exists(metadata_path):
+                        self.logger.warning(f"Metadata file not found: {metadata_path}")
+                        return EnvironmentStatus(
+                            name=name,
+                            status='unknown',
+                            error=f"Metadata file not found: {metadata_path}"
+                        )
+                    
+                    # Read metadata
+                    with open(metadata_path, 'r') as f:
+                        metadata = json.load(f)
+                    
+                    # Return environment status
+                    return EnvironmentStatus(
+                        name=name,
+                        status='running',
+                        connection_info={
+                            'type': 'native_process',
+                            'url': f"http://localhost:{metadata.get('port', 8000)}",
+                            'port': metadata.get('port', 8000),
+                            'db_path': metadata.get('db_path'),
+                            'pid': process.pid
+                        }
+                    )
+                else:
+                    # Process has terminated
+                    stdout, stderr = process.communicate()
+                    
+                    if process.returncode != 0:
+                        self.logger.warning(f"Process terminated with error: {stderr.decode()}")
+                        return EnvironmentStatus(
+                            name=name,
+                            status='failed',
+                            error=f"Process terminated with error: {stderr.decode()}"
+                        )
+                    else:
+                        return EnvironmentStatus(
+                            name=name,
+                            status='stopped'
+                        )
+            
+            # Process not found in memory, check if environment directory exists
+            env_dir = os.path.join(self.base_dir, name)
+            
+            if not os.path.exists(env_dir):
+                self.logger.warning(f"Environment directory not found: {env_dir}")
+                return EnvironmentStatus(
+                    name=name,
+                    status='stopped',
+                    error=f"Environment directory not found: {env_dir}"
+                )
+            
+            # Get metadata file
+            metadata_path = os.path.join(env_dir, 'metadata.json')
+            
+            if not os.path.exists(metadata_path):
+                self.logger.warning(f"Metadata file not found: {metadata_path}")
+                return EnvironmentStatus(
+                    name=name,
+                    status='unknown',
+                    error=f"Metadata file not found: {metadata_path}"
+                )
+            
+            # Read metadata
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            
+            # Check if process is still running
+            pid = metadata.get('pid')
+            if pid:
+                try:
+                    os.kill(pid, 0)  # Check if process exists
+                    
+                    # Process is running but not in our list, add it
+                    self.logger.info(f"Found running process for environment {name}, adding to process list")
+                    
+                    # Return environment status
+                    return EnvironmentStatus(
+                        name=name,
+                        status='running',
+                        connection_info={
+                            'type': 'native_process',
+                            'url': f"http://localhost:{metadata.get('port', 8000)}",
+                            'port': metadata.get('port', 8000),
+                            'db_path': metadata.get('db_path'),
+                            'pid': pid
+                        }
+                    )
+                except OSError:
+                    # Process doesn't exist
+                    return EnvironmentStatus(
+                        name=name,
+                        status='stopped',
+                        error=f"Process not running"
+                    )
+            
+            # No process information
+            return EnvironmentStatus(
+                name=name,
+                status='unknown',
+                error=f"No process information found"
+            )
+        except Exception as e:
+            self.logger.error(f"Error getting status of native process environment {name}: {str(e)}")
+            return EnvironmentStatus(
+                name=name,
+                status='unknown',
+                error=str(e)
+            )
 
 
 class TestEnvironmentProvisioningPipeline(Pipeline):
@@ -1380,174 +1119,336 @@ class TestEnvironmentProvisioningPipeline(Pipeline):
             config_manager: Configuration manager instance.
         """
         super().__init__(config_manager)
-        self.environment_manager = None
-        self.docker_provisioner = None
         self.file_provisioner = None
         self.database_provisioner = None
+        self.native_process_provisioner = None
     
     def initialize(self) -> None:
-        """Initialize the pipeline.
+        """Initialize the test environment provisioning pipeline.
         
         Raises:
             ConfigurationError: If the pipeline cannot be initialized.
         """
-        # Initialize components
-        # self.environment_manager = EnvironmentManager(self.config_manager)
-        # self.environment_manager.initialize()
+        super().initialize()
         
-        # self.docker_provisioner = DockerEnvironmentProvisioner(self.config_manager, self.environment_manager)
-        # self.docker_provisioner.initialize()
-        
-        self.file_provisioner = FileEnvironmentProvisioner(self.config_manager, self.environment_manager)
+        # Initialize provisioners
+        self.file_provisioner = FileEnvironmentProvisioner(self.config_manager)
         self.file_provisioner.initialize()
         
-        self.database_provisioner = DatabaseEnvironmentProvisioner(self.config_manager, self.environment_manager)
+        self.database_provisioner = DatabaseEnvironmentProvisioner(self.config_manager)
         self.database_provisioner.initialize()
         
-        # Add pipeline steps
-        self.add_step(EnvironmentProvisioningStep(
-            self.config_manager,
-            self.environment_manager,
-            self.docker_provisioner,
-            self.file_provisioner,
-            self.database_provisioner
-        ))
+        self.native_process_provisioner = NativeProcessEnvironmentProvisioner(self.config_manager)
+        self.native_process_provisioner.initialize()
+        
+        # Initialize steps
+        self.steps = [
+            PipelineStep(self.prepare_environment_data),
+            PipelineStep(self.provision_environments),
+            PipelineStep(self.save_results)
+        ]
         
         self.logger.info("Test environment provisioning pipeline initialized")
     
-    def validate(self) -> bool:
-        """Validate the pipeline configuration and state.
+    def prepare_environment_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Prepare data for environment provisioning.
+        
+        Args:
+            data: Input data with datasets.
         
         Returns:
-            True if the pipeline is valid, False otherwise.
+            Updated data with environment configurations.
         
         Raises:
-            ValidationError: If validation fails.
+            ProcessingError: If preparation fails.
         """
-        # Validate components
-        self.environment_manager.validate()
+        self.logger.info("Preparing environment data")
         
-        # Validate provisioners based on configuration
-        if self.config_manager.get('test_env_provisioning.docker.enabled', True):
-            try:
-                self.docker_provisioner.validate()
-            except ValidationError as e:
-                self.logger.warning(f"Docker provisioner validation failed: {str(e)}")
-                self.logger.warning("Docker provisioning will be disabled")
-                self.config_manager.config['test_env_provisioning']['docker']['enabled'] = False
-        
-        self.file_provisioner.validate()
-        self.database_provisioner.validate()
-        
-        return True
-
-
-class EnvironmentProvisioningStep(PipelineStep):
-    """Pipeline step for provisioning test environments."""
+        try:
+            datasets = data.get('datasets', {})
+            
+            if not datasets:
+                self.logger.warning("No datasets found for environment provisioning")
+                return data
+            
+            # Get environment configurations
+            env_configs = self.config_manager.get('test_env_provisioning.environments', [])
+            
+            if not env_configs:
+                self.logger.warning("No environment configurations found")
+                return data
+            
+            # Validate environment configurations
+            valid_env_configs = []
+            
+            for config in env_configs:
+                name = config.get('name')
+                env_type = config.get('type')
+                env_datasets = config.get('datasets', [])
+                
+                if not name:
+                    self.logger.warning("Environment configuration missing name, skipping")
+                    continue
+                
+                if not env_type:
+                    self.logger.warning(f"Environment configuration {name} missing type, skipping")
+                    continue
+                
+                if not env_datasets:
+                    self.logger.warning(f"Environment configuration {name} has no datasets, skipping")
+                    continue
+                
+                # Check if datasets exist
+                missing_datasets = [ds for ds in env_datasets if ds not in datasets]
+                
+                if missing_datasets:
+                    self.logger.warning(f"Environment configuration {name} references missing datasets: {missing_datasets}")
+                    continue
+                
+                valid_env_configs.append(config)
+            
+            # Update data
+            result = data.copy()
+            result['environment_configs'] = valid_env_configs
+            
+            self.logger.info(f"Prepared {len(valid_env_configs)} environment configurations")
+            
+            return result
+        except Exception as e:
+            self.logger.error(f"Error preparing environment data: {str(e)}")
+            raise ProcessingError(f"Error preparing environment data: {str(e)}")
     
-    def __init__(self, config_manager: ConfigManager,
-                environment_manager: EnvironmentManager,
-                docker_provisioner: DockerEnvironmentProvisioner,
-                file_provisioner: FileEnvironmentProvisioner,
-                database_provisioner: DatabaseEnvironmentProvisioner):
-        """Initialize the environment provisioning step.
+    def provision_environments(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Provision test environments.
         
         Args:
-            config_manager: Configuration manager instance.
-            environment_manager: EnvironmentManager instance.
-            docker_provisioner: DockerEnvironmentProvisioner instance.
-            file_provisioner: FileEnvironmentProvisioner instance.
-            database_provisioner: DatabaseEnvironmentProvisioner instance.
-        """
-        super().__init__(config_manager)
-        self.environment_manager = environment_manager
-        self.docker_provisioner = docker_provisioner
-        self.file_provisioner = file_provisioner
-        self.database_provisioner = database_provisioner
-    
-    def execute(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute the environment provisioning step.
-        
-        Args:
-            input_data: Dictionary with data, relationships, domain partitions, purpose datasets, and export paths.
+            data: Input data with environment configurations.
         
         Returns:
-            Dictionary with input data and environment statuses.
+            Updated data with provisioned environments.
         
         Raises:
             ProcessingError: If provisioning fails.
         """
         self.logger.info("Provisioning test environments")
         
-        # Check if provisioning is enabled
-        if not self.config_manager.get('test_env_provisioning.enabled', True):
-            self.logger.info("Test environment provisioning is disabled in configuration")
-            return input_data
-        
-        # Get provisioning configuration
-        provisioning_config = self.config_manager.get('test_env_provisioning.environments', [])
-        
-        if not provisioning_config:
-            self.logger.info("No test environments to provision")
-            return input_data
-        
-        # Get available datasets
-        datasets = []
-        
-        # Add domain partitions
-        if 'domain_partitions' in input_data:
-            for domain in input_data['domain_partitions'].keys():
-                datasets.append(f"domain_{domain}")
-        
-        # Add purpose-specific datasets
-        if 'purpose_datasets' in input_data:
-            datasets.extend(input_data['purpose_datasets'].keys())
-        
-        if not datasets:
-            self.logger.warning("No datasets available for provisioning")
-            return input_data
-        
-        # Provision environments
-        environment_statuses = []
-        
-        for env_config in provisioning_config:
-            env_name = env_config.get('name')
-            env_type = env_config.get('type', 'file')
-            env_datasets = env_config.get('datasets', datasets)
+        try:
+            env_configs = data.get('environment_configs', [])
+            datasets = data.get('datasets', {})
             
-            if not env_name:
-                continue
+            if not env_configs:
+                self.logger.warning("No environment configurations found for provisioning")
+                return data
             
-            try:
-                # Check if environment already exists
-                try:
-                    status = self.environment_manager.get_environment_status(env_name)
-                    self.logger.info(f"Environment '{env_name}' already exists with status '{status.status}'")
-                    environment_statuses.append(status)
-                    continue
-                except ProcessingError:
-                    # Environment doesn't exist, provision it
-                    pass
+            # Provision environments
+            environments = {}
+            
+            for config in env_configs:
+                name = config.get('name')
+                env_type = config.get('type')
+                env_datasets = config.get('datasets', [])
+                
+                self.logger.info(f"Provisioning environment {name} of type {env_type}")
+                
+                # Get dataset data
+                dataset_data = {ds: datasets.get(ds, {}) for ds in env_datasets}
                 
                 # Provision environment based on type
-                if env_type == 'docker' and self.config_manager.get('test_env_provisioning.docker.enabled', True):
-                    status = self.docker_provisioner.provision(env_name, env_datasets)
-                elif env_type == 'file':
-                    status = self.file_provisioner.provision(env_name, env_datasets)
+                if env_type == 'file':
+                    status = self.file_provisioner.provision(name, env_datasets, dataset_data)
                 elif env_type == 'database':
-                    status = self.database_provisioner.provision(env_name, env_datasets)
+                    status = self.database_provisioner.provision(name, env_datasets, dataset_data)
+                elif env_type == 'native_process':
+                    status = self.native_process_provisioner.provision(name, env_datasets, dataset_data)
                 else:
                     self.logger.warning(f"Unsupported environment type: {env_type}")
-                    continue
+                    status = EnvironmentStatus(
+                        name=name,
+                        status='failed',
+                        error=f"Unsupported environment type: {env_type}"
+                    )
                 
-                environment_statuses.append(status)
-            except Exception as e:
-                self.logger.error(f"Error provisioning environment '{env_name}': {str(e)}")
-                # Continue with other environments
+                environments[name] = status
+            
+            # Update data
+            result = data.copy()
+            result['environments'] = environments
+            
+            # Log summary
+            successful = sum(1 for status in environments.values() if status.status == 'running')
+            failed = sum(1 for status in environments.values() if status.status == 'failed')
+            
+            self.logger.info(f"Provisioned {len(environments)} environments: {successful} successful, {failed} failed")
+            
+            return result
+        except Exception as e:
+            self.logger.error(f"Error provisioning environments: {str(e)}")
+            raise ProcessingError(f"Error provisioning environments: {str(e)}")
+    
+    def save_results(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Save provisioning results.
         
-        self.logger.info(f"Provisioned {len(environment_statuses)} test environments")
+        Args:
+            data: Input data with provisioned environments.
         
-        return {
-            **input_data,
-            'environment_statuses': environment_statuses
-        }
+        Returns:
+            Updated data with saved results.
+        
+        Raises:
+            ProcessingError: If saving results fails.
+        """
+        self.logger.info("Saving provisioning results")
+        
+        try:
+            environments = data.get('environments', {})
+            
+            if not environments:
+                self.logger.warning("No environments found to save")
+                return data
+            
+            # Create output directory
+            results_dir = os.path.join(self.output_dir, 'results')
+            ensure_directory(results_dir)
+            
+            # Save environment statuses
+            env_statuses = {}
+            
+            for name, status in environments.items():
+                if hasattr(status, 'to_dict'):
+                    env_statuses[name] = status.to_dict()
+                else:
+                    env_statuses[name] = status
+            
+            results_file = os.path.join(results_dir, 'environment_statuses.json')
+            save_json(env_statuses, results_file)
+            
+            # Save summary
+            summary = {
+                'environment_count': len(environments),
+                'successful_count': sum(1 for status in environments.values() if status.status == 'running'),
+                'failed_count': sum(1 for status in environments.values() if status.status == 'failed'),
+                'environments': {name: {'status': status.status, 'type': status.connection_info.get('type') if status.connection_info else None} for name, status in environments.items()}
+            }
+            
+            summary_file = os.path.join(results_dir, 'provisioning_summary.json')
+            save_json(summary, summary_file)
+            
+            # Create connection information file
+            connections = {}
+            
+            for name, status in environments.items():
+                if status.status == 'running' and status.connection_info:
+                    connections[name] = status.connection_info
+            
+            connections_file = os.path.join(results_dir, 'environment_connections.json')
+            save_json(connections, connections_file)
+            
+            # Update data
+            result = data.copy()
+            result['provisioning_results'] = {
+                'results_file': results_file,
+                'summary_file': summary_file,
+                'connections_file': connections_file
+            }
+            
+            self.logger.info("Provisioning results saved")
+            return result
+        except Exception as e:
+            self.logger.error(f"Error saving provisioning results: {str(e)}")
+            raise ProcessingError(f"Error saving provisioning results: {str(e)}")
+    
+    def deprovision_environment(self, name: str) -> EnvironmentStatus:
+        """Deprovision a test environment.
+        
+        Args:
+            name: Name of the environment.
+        
+        Returns:
+            Environment status.
+        """
+        self.logger.info(f"Deprovisioning environment: {name}")
+        
+        try:
+            # Get environment status
+            file_status = self.file_provisioner.get_status(name)
+            
+            if file_status.status == 'running':
+                return self.file_provisioner.deprovision(name)
+            
+            database_status = self.database_provisioner.get_status(name)
+            
+            if database_status.status == 'running':
+                return self.database_provisioner.deprovision(name)
+            
+            native_process_status = self.native_process_provisioner.get_status(name)
+            
+            if native_process_status.status == 'running':
+                return self.native_process_provisioner.deprovision(name)
+            
+            # Environment not found or not running
+            self.logger.warning(f"Environment {name} not found or not running")
+            return EnvironmentStatus(
+                name=name,
+                status='unknown',
+                error=f"Environment not found or not running"
+            )
+        except Exception as e:
+            self.logger.error(f"Error deprovisioning environment {name}: {str(e)}")
+            return EnvironmentStatus(
+                name=name,
+                status='failed',
+                error=str(e)
+            )
+    
+    def get_environment_status(self, name: str) -> EnvironmentStatus:
+        """Get the status of a test environment.
+        
+        Args:
+            name: Name of the environment.
+        
+        Returns:
+            Environment status.
+        """
+        self.logger.info(f"Getting status of environment: {name}")
+        
+        try:
+            # Check each provisioner
+            file_status = self.file_provisioner.get_status(name)
+            
+            if file_status.status != 'unknown' and file_status.status != 'stopped':
+                return file_status
+            
+            database_status = self.database_provisioner.get_status(name)
+            
+            if database_status.status != 'unknown' and database_status.status != 'stopped':
+                return database_status
+            
+            native_process_status = self.native_process_provisioner.get_status(name)
+            
+            if native_process_status.status != 'unknown' and native_process_status.status != 'stopped':
+                return native_process_status
+            
+            # Environment not found or stopped
+            if file_status.status == 'stopped':
+                return file_status
+            
+            if database_status.status == 'stopped':
+                return database_status
+            
+            if native_process_status.status == 'stopped':
+                return native_process_status
+            
+            # Environment not found
+            self.logger.warning(f"Environment {name} not found")
+            return EnvironmentStatus(
+                name=name,
+                status='unknown',
+                error=f"Environment not found"
+            )
+        except Exception as e:
+            self.logger.error(f"Error getting status of environment {name}: {str(e)}")
+            return EnvironmentStatus(
+                name=name,
+                status='unknown',
+                error=str(e)
+            )

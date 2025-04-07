@@ -1,28 +1,29 @@
 """
-Base classes and interfaces for the Data Warehouse Subsampling Framework.
+Base classes for the Data Warehouse Subsampling Framework.
 
-This module provides the core abstractions that are used throughout the framework,
-including base classes for components, interfaces for extensibility, and common
-utilities for logging, configuration, and error handling.
+This module provides the base classes used throughout the framework,
+including Component, Pipeline, and ConfigManager.
 """
 
-import abc
-import logging
 import os
+import logging
 import yaml
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Callable
 from dataclasses import dataclass
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('dwsf.log')
+    ]
 )
-logger = logging.getLogger(__name__)
 
 
 class ConfigurationError(Exception):
-    """Exception raised for errors in the configuration."""
+    """Exception raised for configuration errors."""
     pass
 
 
@@ -32,58 +33,20 @@ class ValidationError(Exception):
 
 
 class ProcessingError(Exception):
-    """Exception raised for errors during data processing."""
+    """Exception raised for processing errors."""
     pass
 
 
-@dataclass
-class DataSourceConfig:
-    """Configuration for a data source."""
-    type: str
-    connection_params: Dict[str, Any]
-    
-    @classmethod
-    def from_dict(cls, config_dict: Dict[str, Any]) -> 'DataSourceConfig':
-        """Create a DataSourceConfig from a dictionary."""
-        return cls(
-            type=config_dict.get('type', ''),
-            connection_params={k: v for k, v in config_dict.items() if k != 'type'}
-        )
-
-
 class ConfigManager:
-    """Manages configuration for the framework."""
+    """Configuration manager for the framework."""
     
-    def __init__(self, config_path: str):
-        """Initialize the ConfigManager.
+    def __init__(self, config: Dict[str, Any]):
+        """Initialize the configuration manager.
         
         Args:
-            config_path: Path to the configuration file.
-        
-        Raises:
-            ConfigurationError: If the configuration file cannot be loaded.
+            config: Configuration dictionary.
         """
-        self.config_path = config_path
-        self.config = {}
-        self.load_config()
-    
-    def load_config(self) -> None:
-        """Load configuration from the config file.
-        
-        Raises:
-            ConfigurationError: If the configuration file cannot be loaded.
-        """
-        try:
-            with open(self.config_path, 'r') as f:
-                self.config = yaml.safe_load(f)
-            
-            # Set log level from config
-            log_level = self.get('general.log_level', 'INFO')
-            logging.getLogger().setLevel(getattr(logging, log_level))
-            
-            logger.info(f"Configuration loaded from {self.config_path}")
-        except Exception as e:
-            raise ConfigurationError(f"Failed to load configuration: {str(e)}")
+        self.config = config
     
     def get(self, path: str, default: Any = None) -> Any:
         """Get a configuration value by path.
@@ -93,7 +56,7 @@ class ConfigManager:
             default: Default value to return if the path is not found.
         
         Returns:
-            The configuration value, or the default if not found.
+            The configuration value at the specified path, or the default value.
         """
         parts = path.split('.')
         value = self.config
@@ -106,23 +69,47 @@ class ConfigManager:
         
         return value
     
-    def get_data_source_config(self, source_name: str) -> Optional[DataSourceConfig]:
-        """Get configuration for a data source.
+    def set(self, path: str, value: Any) -> None:
+        """Set a configuration value by path.
         
         Args:
-            source_name: Name of the data source.
+            path: Dot-separated path to the configuration value.
+            value: Value to set.
+        """
+        parts = path.split('.')
+        config = self.config
+        
+        for i, part in enumerate(parts[:-1]):
+            if part not in config:
+                config[part] = {}
+            config = config[part]
+        
+        config[parts[-1]] = value
+    
+    @classmethod
+    def from_file(cls, file_path: str) -> 'ConfigManager':
+        """Create a configuration manager from a YAML file.
+        
+        Args:
+            file_path: Path to the YAML configuration file.
         
         Returns:
-            DataSourceConfig for the data source, or None if not found.
+            A new ConfigManager instance.
+        
+        Raises:
+            ConfigurationError: If the file cannot be read or parsed.
         """
-        source_config = self.get(f'data_sources.{source_name}')
-        if source_config:
-            return DataSourceConfig.from_dict(source_config)
-        return None
+        try:
+            with open(file_path, 'r') as f:
+                config = yaml.safe_load(f)
+            
+            return cls(config or {})
+        except Exception as e:
+            raise ConfigurationError(f"Failed to load configuration from {file_path}: {str(e)}")
 
 
-class Component(abc.ABC):
-    """Base class for all framework components."""
+class Component:
+    """Base class for all components in the framework."""
     
     def __init__(self, config_manager: ConfigManager):
         """Initialize the component.
@@ -133,20 +120,22 @@ class Component(abc.ABC):
         self.config_manager = config_manager
         self.logger = logging.getLogger(self.__class__.__name__)
     
-    @abc.abstractmethod
     def initialize(self) -> None:
         """Initialize the component.
         
-        This method should be called before using the component.
+        This method should be overridden by subclasses to perform
+        any necessary initialization.
         
         Raises:
-            ConfigurationError: If the component cannot be initialized due to configuration issues.
+            ConfigurationError: If the component cannot be initialized.
         """
         pass
     
-    @abc.abstractmethod
     def validate(self) -> bool:
         """Validate the component configuration and state.
+        
+        This method should be overridden by subclasses to perform
+        any necessary validation.
         
         Returns:
             True if the component is valid, False otherwise.
@@ -154,74 +143,25 @@ class Component(abc.ABC):
         Raises:
             ValidationError: If validation fails.
         """
-        pass
+        return True
 
 
-class DataConnector(Component):
-    """Base class for data source connectors."""
+@dataclass
+class PipelineStep:
+    """A step in a pipeline."""
     
-    def __init__(self, config_manager: ConfigManager, source_name: str):
-        """Initialize the data connector.
-        
-        Args:
-            config_manager: Configuration manager instance.
-            source_name: Name of the data source.
-        
-        Raises:
-            ConfigurationError: If the data source configuration is invalid.
-        """
-        super().__init__(config_manager)
-        self.source_name = source_name
-        self.source_config = config_manager.get_data_source_config(source_name)
-        
-        if not self.source_config:
-            raise ConfigurationError(f"Data source '{source_name}' not found in configuration")
+    function: Callable
+    name: Optional[str] = None
+    enabled: bool = True
     
-    @abc.abstractmethod
-    def connect(self) -> Any:
-        """Connect to the data source.
-        
-        Returns:
-            Connection object or client.
-        
-        Raises:
-            ConnectionError: If connection fails.
-        """
-        pass
-    
-    @abc.abstractmethod
-    def disconnect(self) -> None:
-        """Disconnect from the data source."""
-        pass
-    
-    @abc.abstractmethod
-    def get_table_schema(self, table_name: str) -> Dict[str, Any]:
-        """Get schema information for a table.
-        
-        Args:
-            table_name: Name of the table.
-        
-        Returns:
-            Dictionary with schema information.
-        """
-        pass
-    
-    @abc.abstractmethod
-    def execute_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        """Execute a query on the data source.
-        
-        Args:
-            query: Query string.
-            params: Query parameters.
-        
-        Returns:
-            Query result.
-        """
-        pass
+    def __post_init__(self):
+        """Initialize the step name if not provided."""
+        if self.name is None:
+            self.name = self.function.__name__
 
 
 class Pipeline(Component):
-    """Base class for data processing pipelines."""
+    """Base class for all pipelines in the framework."""
     
     def __init__(self, config_manager: ConfigManager):
         """Initialize the pipeline.
@@ -230,273 +170,238 @@ class Pipeline(Component):
             config_manager: Configuration manager instance.
         """
         super().__init__(config_manager)
-        self.steps = []
+        self.steps: List[PipelineStep] = []
+        self.output_dir = None
     
-    def add_step(self, step: 'PipelineStep') -> None:
-        """Add a step to the pipeline.
+    def initialize(self) -> None:
+        """Initialize the pipeline.
+        
+        This method should be overridden by subclasses to set up
+        the pipeline steps and perform any necessary initialization.
+        
+        Raises:
+            ConfigurationError: If the pipeline cannot be initialized.
+        """
+        # Create output directory
+        self.output_dir = os.path.join(
+            self.config_manager.get('general.output_directory', '/output/dwsf'),
+            self.__class__.__name__.lower().replace('pipeline', '')
+        )
+        os.makedirs(self.output_dir, exist_ok=True)
+    
+    def execute(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute the pipeline.
+        
+        This method executes each step in the pipeline in order.
         
         Args:
-            step: Pipeline step to add.
-        """
-        self.steps.append(step)
-    
-    def run(self) -> Any:
-        """Run the pipeline.
+            data: Input data for the pipeline.
         
         Returns:
-            Result of the pipeline execution.
+            The output data from the pipeline.
         
         Raises:
             ProcessingError: If pipeline execution fails.
         """
-        result = None
-        for step in self.steps:
-            try:
-                self.logger.info(f"Running pipeline step: {step.__class__.__name__}")
-                result = step.execute(result)
-            except Exception as e:
-                self.logger.error(f"Pipeline step {step.__class__.__name__} failed: {str(e)}")
-                raise ProcessingError(f"Pipeline execution failed at step {step.__class__.__name__}: {str(e)}")
+        self.logger.info(f"Executing pipeline: {self.__class__.__name__}")
         
+        result = data.copy()
+        
+        for step in self.steps:
+            if step.enabled:
+                self.logger.info(f"Executing step: {step.name}")
+                try:
+                    result = step.function(result)
+                except Exception as e:
+                    self.logger.error(f"Error in step {step.name}: {str(e)}")
+                    raise ProcessingError(f"Error in step {step.name}: {str(e)}")
+        
+        self.logger.info(f"Pipeline completed: {self.__class__.__name__}")
         return result
 
 
-class PipelineStep(abc.ABC):
-    """Base class for pipeline steps."""
+@dataclass
+class Relationship:
+    """A relationship between two tables."""
     
-    def __init__(self, config_manager: ConfigManager):
-        """Initialize the pipeline step.
-        
-        Args:
-            config_manager: Configuration manager instance.
-        """
-        self.config_manager = config_manager
-        self.logger = logging.getLogger(self.__class__.__name__)
+    parent_table: str
+    parent_column: str
+    child_table: str
+    child_column: str
+    confidence: float = 1.0
     
-    @abc.abstractmethod
-    def execute(self, input_data: Any) -> Any:
-        """Execute the pipeline step.
-        
-        Args:
-            input_data: Input data from the previous step.
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the relationship to a dictionary.
         
         Returns:
-            Result of the step execution.
-        
-        Raises:
-            ProcessingError: If step execution fails.
+            A dictionary representation of the relationship.
         """
-        pass
-
-
-class DataProcessor(Component):
-    """Base class for data processors."""
+        return {
+            'parent_table': self.parent_table,
+            'parent_column': self.parent_column,
+            'child_table': self.child_table,
+            'child_column': self.child_column,
+            'confidence': self.confidence
+        }
     
-    @abc.abstractmethod
-    def process(self, data: Any) -> Any:
-        """Process data.
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Relationship':
+        """Create a relationship from a dictionary.
         
         Args:
-            data: Input data.
+            data: Dictionary representation of the relationship.
         
         Returns:
-            Processed data.
-        
-        Raises:
-            ProcessingError: If processing fails.
+            A new Relationship instance.
         """
-        pass
+        return cls(
+            parent_table=data['parent_table'],
+            parent_column=data['parent_column'],
+            child_table=data['child_table'],
+            child_column=data['child_column'],
+            confidence=data.get('confidence', 1.0)
+        )
 
 
-class AnomalyDetector(DataProcessor):
-    """Base class for anomaly detectors."""
+@dataclass
+class SamplingResult:
+    """Result of a sampling operation."""
     
-    @abc.abstractmethod
-    def detect(self, data: Any) -> Dict[str, Any]:
-        """Detect anomalies in data.
-        
-        Args:
-            data: Input data.
+    table_name: str
+    domain: str
+    original_row_count: int
+    sampled_row_count: int
+    sampling_method: str
+    sampling_rate: float
+    metadata: Dict[str, Any] = None
+    
+    def __post_init__(self):
+        """Initialize metadata if not provided."""
+        if self.metadata is None:
+            self.metadata = {}
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the sampling result to a dictionary.
         
         Returns:
-            Dictionary with anomaly detection results.
-        
-        Raises:
-            ProcessingError: If anomaly detection fails.
+            A dictionary representation of the sampling result.
         """
-        pass
-
-
-class SamplingTechnique(DataProcessor):
-    """Base class for sampling techniques."""
+        return {
+            'table_name': self.table_name,
+            'domain': self.domain,
+            'original_row_count': self.original_row_count,
+            'sampled_row_count': self.sampled_row_count,
+            'sampling_method': self.sampling_method,
+            'sampling_rate': self.sampling_rate,
+            'metadata': self.metadata
+        }
     
-    @abc.abstractmethod
-    def sample(self, data: Any, sample_size: float) -> Any:
-        """Sample data.
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'SamplingResult':
+        """Create a sampling result from a dictionary.
         
         Args:
-            data: Input data.
-            sample_size: Sample size as a fraction of the input data.
+            data: Dictionary representation of the sampling result.
         
         Returns:
-            Sampled data.
-        
-        Raises:
-            ProcessingError: If sampling fails.
+            A new SamplingResult instance.
         """
-        pass
+        return cls(
+            table_name=data['table_name'],
+            domain=data['domain'],
+            original_row_count=data['original_row_count'],
+            sampled_row_count=data['sampled_row_count'],
+            sampling_method=data['sampling_method'],
+            sampling_rate=data['sampling_rate'],
+            metadata=data.get('metadata', {})
+        )
 
 
-class DataClassifier(DataProcessor):
-    """Base class for data classifiers."""
+@dataclass
+class IntegrationResult:
+    """Result of a data integration operation."""
     
-    @abc.abstractmethod
-    def classify(self, data: Any) -> Dict[str, Any]:
-        """Classify data.
-        
-        Args:
-            data: Input data.
+    name: str
+    tables: List[str]
+    row_counts: Dict[str, int]
+    metadata: Dict[str, Any] = None
+    
+    def __post_init__(self):
+        """Initialize metadata if not provided."""
+        if self.metadata is None:
+            self.metadata = {}
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the integration result to a dictionary.
         
         Returns:
-            Dictionary with classification results.
-        
-        Raises:
-            ProcessingError: If classification fails.
+            A dictionary representation of the integration result.
         """
-        pass
-
-
-class DataIntegrator(DataProcessor):
-    """Base class for data integrators."""
+        return {
+            'name': self.name,
+            'tables': self.tables,
+            'row_counts': self.row_counts,
+            'metadata': self.metadata
+        }
     
-    @abc.abstractmethod
-    def integrate(self, normal_data: Any, anomaly_data: Any) -> Any:
-        """Integrate normal data and anomaly data.
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'IntegrationResult':
+        """Create an integration result from a dictionary.
         
         Args:
-            normal_data: Normal data.
-            anomaly_data: Anomaly data.
+            data: Dictionary representation of the integration result.
         
         Returns:
-            Integrated data.
-        
-        Raises:
-            ProcessingError: If integration fails.
+            A new IntegrationResult instance.
         """
-        pass
+        return cls(
+            name=data['name'],
+            tables=data['tables'],
+            row_counts=data['row_counts'],
+            metadata=data.get('metadata', {})
+        )
 
 
-class EnvironmentProvisioner(Component):
-    """Base class for environment provisioners."""
+@dataclass
+class EnvironmentStatus:
+    """Status of a test environment."""
     
-    @abc.abstractmethod
-    def provision(self, dataset: Any, env_name: str) -> Dict[str, Any]:
-        """Provision a test environment.
-        
-        Args:
-            dataset: Dataset to provision.
-            env_name: Name of the environment.
+    name: str
+    status: str  # 'running', 'stopped', 'failed'
+    connection_info: Dict[str, Any] = None
+    error: str = None
+    
+    def __post_init__(self):
+        """Initialize connection_info if not provided."""
+        if self.connection_info is None:
+            self.connection_info = {}
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the environment status to a dictionary.
         
         Returns:
-            Dictionary with environment details.
-        
-        Raises:
-            ProcessingError: If provisioning fails.
+            A dictionary representation of the environment status.
         """
-        pass
-
-
-class DataWarehouseSubsamplingFramework:
-    """Main framework class that orchestrates all components."""
+        return {
+            'name': self.name,
+            'status': self.status,
+            'connection_info': self.connection_info,
+            'error': self.error
+        }
     
-    def __init__(self, config_path: str):
-        """Initialize the framework.
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'EnvironmentStatus':
+        """Create an environment status from a dictionary.
         
         Args:
-            config_path: Path to the configuration file.
+            data: Dictionary representation of the environment status.
         
-        Raises:
-            ConfigurationError: If the configuration file cannot be loaded.
+        Returns:
+            A new EnvironmentStatus instance.
         """
-        self.config_manager = ConfigManager(config_path)
-        self.logger = logging.getLogger(self.__class__.__name__)
-        
-        # Initialize components
-        self.data_classification = None
-        self.anomaly_detection = None
-        self.core_sampling = None
-        self.data_integration = None
-        self.test_env_provisioning = None
-    
-    def initialize(self) -> None:
-        """Initialize all framework components.
-        
-        Raises:
-            ConfigurationError: If components cannot be initialized.
-        """
-        self.logger.info("Initializing Data Warehouse Subsampling Framework")
-        
-        # Create output directory if it doesn't exist
-        output_dir = self.config_manager.get('general.output_directory', '/output/dwsf')
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Initialize components based on configuration
-        # These will be implemented in their respective modules
-        pass
-    
-    def run(self) -> None:
-        """Run the complete framework pipeline.
-        
-        Raises:
-            ProcessingError: If pipeline execution fails.
-        """
-        self.logger.info("Running Data Warehouse Subsampling Framework")
-        
-        # Run each stage of the pipeline
-        self.run_data_classification()
-        self.run_anomaly_detection()
-        self.run_core_sampling()
-        self.run_data_integration()
-        self.run_test_env_provisioning()
-        
-        self.logger.info("Data Warehouse Subsampling Framework execution completed successfully")
-    
-    def run_data_classification(self) -> None:
-        """Run the data classification stage."""
-        if self.config_manager.get('data_classification.enabled', True):
-            self.logger.info("Running data classification stage")
-            # Implementation will be added in the data_classification module
-        else:
-            self.logger.info("Data classification stage is disabled in configuration")
-    
-    def run_anomaly_detection(self) -> None:
-        """Run the anomaly detection stage."""
-        if self.config_manager.get('anomaly_detection.enabled', True):
-            self.logger.info("Running anomaly detection stage")
-            # Implementation will be added in the anomaly_detection module
-        else:
-            self.logger.info("Anomaly detection stage is disabled in configuration")
-    
-    def run_core_sampling(self) -> None:
-        """Run the core sampling stage."""
-        if self.config_manager.get('core_sampling.enabled', True):
-            self.logger.info("Running core sampling stage")
-            # Implementation will be added in the core_sampling module
-        else:
-            self.logger.info("Core sampling stage is disabled in configuration")
-    
-    def run_data_integration(self) -> None:
-        """Run the data integration stage."""
-        if self.config_manager.get('data_integration.enabled', True):
-            self.logger.info("Running data integration stage")
-            # Implementation will be added in the data_integration module
-        else:
-            self.logger.info("Data integration stage is disabled in configuration")
-    
-    def run_test_env_provisioning(self) -> None:
-        """Run the test environment provisioning stage."""
-        if self.config_manager.get('test_env_provisioning.enabled', True):
-            self.logger.info("Running test environment provisioning stage")
-            # Implementation will be added in the test_env_provisioning module
-        else:
-            self.logger.info("Test environment provisioning stage is disabled in configuration")
+        return cls(
+            name=data['name'],
+            status=data['status'],
+            connection_info=data.get('connection_info', {}),
+            error=data.get('error')
+        )

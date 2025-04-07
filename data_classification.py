@@ -1,9 +1,9 @@
 """
-Data Classification and Partitioning Module for the Data Warehouse Subsampling Framework.
+Data Classification and Partitioning module for the Data Warehouse Subsampling Framework.
 
-This module implements the first layer of the data subsampling architecture,
-responsible for analyzing and classifying data across business domains,
-identifying data relationships, and partitioning data for optimal processing.
+This module provides components for classifying and partitioning data
+across business domains, identifying relationships between tables,
+and preparing data for subsequent processing steps.
 """
 
 import os
@@ -11,622 +11,674 @@ import logging
 import pandas as pd
 import numpy as np
 from typing import Any, Dict, List, Optional, Union, Tuple
-from dataclasses import dataclass
 import json
-from datetime import datetime
+import re
+from collections import defaultdict
+import networkx as nx
 
-from ..common.base import Component, ConfigManager, PipelineStep, Pipeline, ProcessingError, ValidationError
-from ..common.utils import validate_data_frame, detect_relationships, split_dataframe_by_domain
-from ..common.connectors import create_connector
+from ..common.base import Component, ConfigManager, Pipeline, PipelineStep, Relationship, ProcessingError
+from ..common.utils import save_dataframe, load_dataframe, save_json, load_json, ensure_directory
+from ..common.connectors import DataConnector, create_connector
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class DataProfile:
-    """Data profile for a table or column."""
-    name: str
-    data_type: str
-    row_count: int
-    null_count: int
-    null_percentage: float
-    unique_count: int
-    unique_percentage: float
-    min_value: Any = None
-    max_value: Any = None
-    mean_value: float = None
-    median_value: float = None
-    std_dev: float = None
-    quartiles: List[float] = None
-    histogram: Dict[str, Any] = None
-    sample_values: List[Any] = None
-    created_at: datetime = None
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert the data profile to a dictionary.
-        
-        Returns:
-            Dictionary representation of the data profile.
-        """
-        return {
-            'name': self.name,
-            'data_type': self.data_type,
-            'row_count': self.row_count,
-            'null_count': self.null_count,
-            'null_percentage': self.null_percentage,
-            'unique_count': self.unique_count,
-            'unique_percentage': self.unique_percentage,
-            'min_value': self.min_value,
-            'max_value': self.max_value,
-            'mean_value': self.mean_value,
-            'median_value': self.median_value,
-            'std_dev': self.std_dev,
-            'quartiles': self.quartiles,
-            'histogram': self.histogram,
-            'sample_values': self.sample_values,
-            'created_at': self.created_at.isoformat() if self.created_at else None
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'DataProfile':
-        """Create a DataProfile from a dictionary.
-        
-        Args:
-            data: Dictionary with data profile information.
-        
-        Returns:
-            DataProfile instance.
-        """
-        created_at = None
-        if data.get('created_at'):
-            try:
-                created_at = datetime.fromisoformat(data['created_at'])
-            except (ValueError, TypeError):
-                created_at = None
-        
-        return cls(
-            name=data.get('name', ''),
-            data_type=data.get('data_type', ''),
-            row_count=data.get('row_count', 0),
-            null_count=data.get('null_count', 0),
-            null_percentage=data.get('null_percentage', 0.0),
-            unique_count=data.get('unique_count', 0),
-            unique_percentage=data.get('unique_percentage', 0.0),
-            min_value=data.get('min_value'),
-            max_value=data.get('max_value'),
-            mean_value=data.get('mean_value'),
-            median_value=data.get('median_value'),
-            std_dev=data.get('std_dev'),
-            quartiles=data.get('quartiles'),
-            histogram=data.get('histogram'),
-            sample_values=data.get('sample_values'),
-            created_at=created_at
-        )
-
-
-@dataclass
-class TableRelationship:
-    """Relationship between two tables."""
-    parent_table: str
-    parent_column: str
-    child_table: str
-    child_column: str
-    relationship_type: str  # 'one-to-one', 'one-to-many', 'many-to-one', 'many-to-many'
-    confidence: float  # 0.0 to 1.0
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert the relationship to a dictionary.
-        
-        Returns:
-            Dictionary representation of the relationship.
-        """
-        return {
-            'parent_table': self.parent_table,
-            'parent_column': self.parent_column,
-            'child_table': self.child_table,
-            'child_column': self.child_column,
-            'relationship_type': self.relationship_type,
-            'confidence': self.confidence
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'TableRelationship':
-        """Create a TableRelationship from a dictionary.
-        
-        Args:
-            data: Dictionary with relationship information.
-        
-        Returns:
-            TableRelationship instance.
-        """
-        return cls(
-            parent_table=data.get('parent_table', ''),
-            parent_column=data.get('parent_column', ''),
-            child_table=data.get('child_table', ''),
-            child_column=data.get('child_column', ''),
-            relationship_type=data.get('relationship_type', 'one-to-many'),
-            confidence=data.get('confidence', 0.0)
-        )
-
-
-@dataclass
-class DomainPartition:
-    """Partition of data by business domain."""
-    name: str
-    tables: List[str]
-    description: str = None
-    priority: int = 0
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert the domain partition to a dictionary.
-        
-        Returns:
-            Dictionary representation of the domain partition.
-        """
-        return {
-            'name': self.name,
-            'tables': self.tables,
-            'description': self.description,
-            'priority': self.priority
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'DomainPartition':
-        """Create a DomainPartition from a dictionary.
-        
-        Args:
-            data: Dictionary with domain partition information.
-        
-        Returns:
-            DomainPartition instance.
-        """
-        return cls(
-            name=data.get('name', ''),
-            tables=data.get('tables', []),
-            description=data.get('description'),
-            priority=data.get('priority', 0)
-        )
-
-
-class DataProfiler(Component):
-    """Component for profiling data."""
+class DomainDetector(Component):
+    """Component for detecting and classifying data domains."""
     
     def __init__(self, config_manager: ConfigManager):
-        """Initialize the data profiler.
+        """Initialize the domain detector.
         
         Args:
             config_manager: Configuration manager instance.
         """
         super().__init__(config_manager)
-        self.output_dir = None
+        self.method = None
+        self.manual_domains = None
     
     def initialize(self) -> None:
-        """Initialize the data profiler.
+        """Initialize the domain detector.
         
         Raises:
-            ConfigurationError: If the profiler cannot be initialized.
+            ConfigurationError: If the domain detector cannot be initialized.
         """
-        # Create output directory
-        self.output_dir = os.path.join(
-            self.config_manager.get('general.output_directory', '/output/dwsf'),
-            'data_classification',
-            'profiles'
-        )
-        os.makedirs(self.output_dir, exist_ok=True)
+        self.method = self.config_manager.get('data_classification.domain_detection.method', 'rule_based')
+        self.manual_domains = self.config_manager.get('data_classification.domain_detection.manual_domains', {})
         
-        self.logger.info("Data profiler initialized")
+        self.logger.info(f"Domain detector initialized with method: {self.method}")
     
-    def validate(self) -> bool:
-        """Validate the data profiler configuration and state.
+    def detect_domains(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, List[str]]:
+        """Detect domains in the data.
         
-        Returns:
-            True if the profiler is valid, False otherwise.
-        
-        Raises:
-            ValidationError: If validation fails.
-        """
-        if not os.path.exists(self.output_dir):
-            raise ValidationError(f"Output directory does not exist: {self.output_dir}")
-        
-        return True
-    
-    def profile_table(self, df: pd.DataFrame, table_name: str) -> Dict[str, Any]:
-        """Profile a table.
+        This method analyzes table structures, column names, and data patterns
+        to group related tables into logical domains.
         
         Args:
-            df: DataFrame containing the table data.
-            table_name: Name of the table.
+            tables: Dictionary mapping table names to DataFrames.
         
         Returns:
-            Dictionary with table profile information.
+            Dictionary mapping domain names to lists of table names.
         """
-        if not validate_data_frame(df):
-            self.logger.warning(f"Invalid DataFrame for table {table_name}")
-            return {}
+        self.logger.info(f"Detecting domains using method: {self.method}")
         
-        self.logger.info(f"Profiling table {table_name} with {len(df)} rows and {len(df.columns)} columns")
-        
-        # Create table profile
-        table_profile = DataProfile(
-            name=table_name,
-            data_type='table',
-            row_count=len(df),
-            null_count=df.isnull().sum().sum(),
-            null_percentage=(df.isnull().sum().sum() / (len(df) * len(df.columns))) * 100 if len(df) > 0 and len(df.columns) > 0 else 0,
-            unique_count=0,  # Not applicable for tables
-            unique_percentage=0,  # Not applicable for tables
-            created_at=datetime.now()
-        )
-        
-        # Profile columns
-        column_profiles = {}
-        for column in df.columns:
-            column_profile = self.profile_column(df, column)
-            column_profiles[column] = column_profile.to_dict()
-        
-        # Save profiles
-        result = {
-            'table': table_profile.to_dict(),
-            'columns': column_profiles
-        }
-        
-        # Save to file
-        output_file = os.path.join(self.output_dir, f"{table_name}_profile.json")
-        with open(output_file, 'w') as f:
-            json.dump(result, f, indent=2)
-        
-        self.logger.info(f"Table profile saved to {output_file}")
-        
-        return result
-    
-    def profile_column(self, df: pd.DataFrame, column_name: str) -> DataProfile:
-        """Profile a column.
-        
-        Args:
-            df: DataFrame containing the column data.
-            column_name: Name of the column.
-        
-        Returns:
-            DataProfile for the column.
-        """
-        if column_name not in df.columns:
-            self.logger.warning(f"Column {column_name} not found in DataFrame")
-            return DataProfile(
-                name=column_name,
-                data_type='unknown',
-                row_count=0,
-                null_count=0,
-                null_percentage=0,
-                unique_count=0,
-                unique_percentage=0,
-                created_at=datetime.now()
-            )
-        
-        # Get column data
-        column_data = df[column_name]
-        
-        # Determine data type
-        if pd.api.types.is_numeric_dtype(column_data):
-            data_type = 'numeric'
-        elif pd.api.types.is_datetime64_dtype(column_data):
-            data_type = 'datetime'
-        elif pd.api.types.is_bool_dtype(column_data):
-            data_type = 'boolean'
+        if self.method == 'manual':
+            return self._detect_domains_manual(tables)
+        elif self.method == 'rule_based':
+            return self._detect_domains_rule_based(tables)
+        elif self.method == 'clustering':
+            return self._detect_domains_clustering(tables)
         else:
-            data_type = 'string'
+            self.logger.warning(f"Unknown domain detection method: {self.method}, falling back to rule-based")
+            return self._detect_domains_rule_based(tables)
+    
+    def _detect_domains_manual(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, List[str]]:
+        """Detect domains using manual configuration.
         
-        # Calculate statistics
-        row_count = len(column_data)
-        null_count = column_data.isnull().sum()
-        null_percentage = (null_count / row_count) * 100 if row_count > 0 else 0
+        Args:
+            tables: Dictionary mapping table names to DataFrames.
         
-        # Calculate unique values
-        unique_values = column_data.dropna().unique()
-        unique_count = len(unique_values)
-        unique_percentage = (unique_count / (row_count - null_count)) * 100 if (row_count - null_count) > 0 else 0
+        Returns:
+            Dictionary mapping domain names to lists of table names.
+        """
+        self.logger.info("Detecting domains using manual configuration")
         
-        # Calculate min, max, mean, median, std_dev
-        min_value = None
-        max_value = None
-        mean_value = None
-        median_value = None
-        std_dev = None
-        quartiles = None
-        histogram = None
+        # Validate manual domains
+        for domain, domain_tables in self.manual_domains.items():
+            for table in domain_tables:
+                if table not in tables:
+                    self.logger.warning(f"Table {table} in domain {domain} not found in data")
         
-        if data_type == 'numeric':
-            try:
-                min_value = float(column_data.min())
-                max_value = float(column_data.max())
-                mean_value = float(column_data.mean())
-                median_value = float(column_data.median())
-                std_dev = float(column_data.std())
+        # Assign unassigned tables to 'other' domain
+        assigned_tables = set()
+        for domain_tables in self.manual_domains.values():
+            assigned_tables.update(domain_tables)
+        
+        unassigned_tables = set(tables.keys()) - assigned_tables
+        
+        domains = {domain: list(domain_tables) for domain, domain_tables in self.manual_domains.items()}
+        
+        if unassigned_tables:
+            domains['other'] = list(unassigned_tables)
+        
+        return domains
+    
+    def _detect_domains_rule_based(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, List[str]]:
+        """Detect domains using rule-based approach.
+        
+        This method uses table name patterns and column relationships
+        to group tables into domains.
+        
+        Args:
+            tables: Dictionary mapping table names to DataFrames.
+        
+        Returns:
+            Dictionary mapping domain names to lists of table names.
+        """
+        self.logger.info("Detecting domains using rule-based approach")
+        
+        # Define common domain prefixes/patterns
+        domain_patterns = {
+            'customer': [r'customer', r'client', r'account'],
+            'product': [r'product', r'item', r'catalog'],
+            'order': [r'order', r'sale', r'transaction'],
+            'inventory': [r'inventory', r'stock', r'warehouse'],
+            'employee': [r'employee', r'staff', r'personnel'],
+            'finance': [r'finance', r'accounting', r'payment'],
+            'marketing': [r'marketing', r'campaign', r'promotion'],
+            'shipping': [r'shipping', r'delivery', r'logistics']
+        }
+        
+        # Compile patterns
+        compiled_patterns = {
+            domain: [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
+            for domain, patterns in domain_patterns.items()
+        }
+        
+        # Assign tables to domains
+        table_domains = {}
+        for table_name in tables.keys():
+            assigned = False
+            
+            for domain, patterns in compiled_patterns.items():
+                for pattern in patterns:
+                    if pattern.search(table_name):
+                        table_domains[table_name] = domain
+                        assigned = True
+                        break
                 
-                # Calculate quartiles
-                quartiles = [
-                    float(column_data.quantile(0.25)),
-                    float(column_data.quantile(0.5)),
-                    float(column_data.quantile(0.75))
-                ]
+                if assigned:
+                    break
+            
+            if not assigned:
+                table_domains[table_name] = 'other'
+        
+        # Group tables by domain
+        domains = defaultdict(list)
+        for table_name, domain in table_domains.items():
+            domains[domain].append(table_name)
+        
+        return dict(domains)
+    
+    def _detect_domains_clustering(self, tables: Dict[str, pd.DataFrame]) -> Dict[str, List[str]]:
+        """Detect domains using clustering approach.
+        
+        This method uses column name similarity and data patterns
+        to cluster tables into domains.
+        
+        Args:
+            tables: Dictionary mapping table names to DataFrames.
+        
+        Returns:
+            Dictionary mapping domain names to lists of table names.
+        """
+        self.logger.info("Detecting domains using clustering approach")
+        
+        # Create a graph of table relationships
+        G = nx.Graph()
+        
+        # Add nodes for each table
+        for table_name in tables.keys():
+            G.add_node(table_name)
+        
+        # Add edges based on column name similarity
+        for table1, df1 in tables.items():
+            cols1 = set(df1.columns)
+            
+            for table2, df2 in tables.items():
+                if table1 >= table2:  # Avoid duplicate edges and self-loops
+                    continue
                 
-                # Create histogram
-                hist, bin_edges = np.histogram(column_data.dropna(), bins=10)
-                histogram = {
-                    'counts': hist.tolist(),
-                    'bin_edges': bin_edges.tolist()
-                }
-            except Exception as e:
-                self.logger.warning(f"Error calculating statistics for column {column_name}: {str(e)}")
-        elif data_type == 'datetime':
-            try:
-                min_value = column_data.min().isoformat()
-                max_value = column_data.max().isoformat()
-            except Exception as e:
-                self.logger.warning(f"Error calculating statistics for column {column_name}: {str(e)}")
-        elif data_type == 'string':
-            try:
-                # Get min and max string lengths
-                min_value = min(len(str(x)) for x in column_data.dropna())
-                max_value = max(len(str(x)) for x in column_data.dropna())
-                mean_value = sum(len(str(x)) for x in column_data.dropna()) / len(column_data.dropna()) if len(column_data.dropna()) > 0 else 0
-            except Exception as e:
-                self.logger.warning(f"Error calculating statistics for column {column_name}: {str(e)}")
+                cols2 = set(df2.columns)
+                
+                # Calculate Jaccard similarity of column names
+                intersection = len(cols1.intersection(cols2))
+                union = len(cols1.union(cols2))
+                
+                if union > 0:
+                    similarity = intersection / union
+                    
+                    # Add edge if similarity is above threshold
+                    if similarity > 0.2:
+                        G.add_edge(table1, table2, weight=similarity)
         
-        # Get sample values
-        sample_values = column_data.dropna().sample(min(10, unique_count), random_state=42).tolist()
-        
-        # Create column profile
-        return DataProfile(
-            name=column_name,
-            data_type=data_type,
-            row_count=row_count,
-            null_count=null_count,
-            null_percentage=null_percentage,
-            unique_count=unique_count,
-            unique_percentage=unique_percentage,
-            min_value=min_value,
-            max_value=max_value,
-            mean_value=mean_value,
-            median_value=median_value,
-            std_dev=std_dev,
-            quartiles=quartiles,
-            histogram=histogram,
-            sample_values=sample_values,
-            created_at=datetime.now()
-        )
+        # Find communities (domains) using Louvain method
+        try:
+            import community as community_louvain
+            partition = community_louvain.best_partition(G)
+            
+            # Group tables by community
+            domains = defaultdict(list)
+            for table_name, community_id in partition.items():
+                domains[f"domain_{community_id}"].append(table_name)
+            
+            return dict(domains)
+        except ImportError:
+            self.logger.warning("community package not found, falling back to connected components")
+            
+            # Find connected components
+            components = list(nx.connected_components(G))
+            
+            # Group tables by component
+            domains = {}
+            for i, component in enumerate(components):
+                domains[f"domain_{i}"] = list(component)
+            
+            return domains
 
 
-class RelationshipMapper(Component):
-    """Component for mapping relationships between tables."""
+class RelationshipDiscoverer(Component):
+    """Component for discovering relationships between tables."""
     
     def __init__(self, config_manager: ConfigManager):
-        """Initialize the relationship mapper.
+        """Initialize the relationship discoverer.
         
         Args:
             config_manager: Configuration manager instance.
         """
         super().__init__(config_manager)
-        self.output_dir = None
+        self.methods = None
+        self.min_confidence = None
     
     def initialize(self) -> None:
-        """Initialize the relationship mapper.
+        """Initialize the relationship discoverer.
         
         Raises:
-            ConfigurationError: If the mapper cannot be initialized.
+            ConfigurationError: If the relationship discoverer cannot be initialized.
         """
-        # Create output directory
-        self.output_dir = os.path.join(
-            self.config_manager.get('general.output_directory', '/output/dwsf'),
-            'data_classification',
-            'relationships'
-        )
-        os.makedirs(self.output_dir, exist_ok=True)
+        self.methods = self.config_manager.get('data_classification.relationship_discovery.methods', ['name_matching', 'foreign_key_analysis'])
+        self.min_confidence = self.config_manager.get('data_classification.relationship_discovery.min_confidence', 0.8)
         
-        self.logger.info("Relationship mapper initialized")
+        self.logger.info(f"Relationship discoverer initialized with methods: {self.methods}")
     
-    def validate(self) -> bool:
-        """Validate the relationship mapper configuration and state.
+    def discover_relationships(self, tables: Dict[str, pd.DataFrame]) -> List[Relationship]:
+        """Discover relationships between tables.
         
-        Returns:
-            True if the mapper is valid, False otherwise.
-        
-        Raises:
-            ValidationError: If validation fails.
-        """
-        if not os.path.exists(self.output_dir):
-            raise ValidationError(f"Output directory does not exist: {self.output_dir}")
-        
-        return True
-    
-    def map_relationships(self, dfs: Dict[str, pd.DataFrame]) -> List[TableRelationship]:
-        """Map relationships between tables.
+        This method analyzes foreign key relationships, naming patterns,
+        and data correlations to identify relationships between tables.
         
         Args:
-            dfs: Dictionary mapping table names to DataFrames.
+            tables: Dictionary mapping table names to DataFrames.
         
         Returns:
-            List of TableRelationship instances.
+            List of discovered relationships.
         """
-        self.logger.info(f"Mapping relationships between {len(dfs)} tables")
+        self.logger.info(f"Discovering relationships using methods: {self.methods}")
         
-        # Detect relationships
-        detected_relationships = detect_relationships(dfs)
-        
-        # Convert to TableRelationship instances
         relationships = []
-        for rel in detected_relationships:
-            # Determine relationship type
-            relationship_type = 'one-to-many'  # Default
-            
-            # Check if parent column is a primary key
-            parent_table = rel['parent_table']
-            parent_column = rel['parent_column']
-            parent_df = dfs[parent_table]
-            
-            # Check if child column is a primary key
-            child_table = rel['child_table']
-            child_column = rel['child_column']
-            child_df = dfs[child_table]
-            
-            # Check if parent column has unique values
-            parent_unique = len(parent_df[parent_column].dropna().unique()) == len(parent_df[parent_column].dropna())
-            
-            # Check if child column has unique values
-            child_unique = len(child_df[child_column].dropna().unique()) == len(child_df[child_column].dropna())
-            
-            # Determine relationship type
-            if parent_unique and child_unique:
-                relationship_type = 'one-to-one'
-            elif parent_unique and not child_unique:
-                relationship_type = 'one-to-many'
-            elif not parent_unique and child_unique:
-                relationship_type = 'many-to-one'
-            else:
-                relationship_type = 'many-to-many'
-            
-            # Create TableRelationship
-            relationship = TableRelationship(
-                parent_table=parent_table,
-                parent_column=parent_column,
-                child_table=child_table,
-                child_column=child_column,
-                relationship_type=relationship_type,
-                confidence=rel['confidence']
-            )
-            
-            relationships.append(relationship)
         
-        # Save relationships
-        self._save_relationships(relationships)
+        if 'name_matching' in self.methods:
+            relationships.extend(self._discover_relationships_name_matching(tables))
+        
+        if 'foreign_key_analysis' in self.methods:
+            relationships.extend(self._discover_relationships_foreign_key_analysis(tables))
+        
+        if 'data_profiling' in self.methods:
+            relationships.extend(self._discover_relationships_data_profiling(tables))
+        
+        # Filter relationships by confidence
+        relationships = [r for r in relationships if r.confidence >= self.min_confidence]
+        
+        # Remove duplicates
+        unique_relationships = []
+        relationship_keys = set()
+        
+        for r in relationships:
+            key = (r.parent_table, r.parent_column, r.child_table, r.child_column)
+            
+            if key not in relationship_keys:
+                relationship_keys.add(key)
+                unique_relationships.append(r)
+        
+        self.logger.info(f"Discovered {len(unique_relationships)} unique relationships")
+        return unique_relationships
+    
+    def _discover_relationships_name_matching(self, tables: Dict[str, pd.DataFrame]) -> List[Relationship]:
+        """Discover relationships using name matching.
+        
+        This method identifies potential relationships based on column naming patterns.
+        
+        Args:
+            tables: Dictionary mapping table names to DataFrames.
+        
+        Returns:
+            List of discovered relationships.
+        """
+        self.logger.info("Discovering relationships using name matching")
+        
+        relationships = []
+        
+        for parent_table, parent_df in tables.items():
+            for parent_column in parent_df.columns:
+                # Check if column name ends with '_id' or is 'id'
+                if parent_column.lower() == 'id' or parent_column.lower().endswith('_id'):
+                    # For 'id' column, look for tables that might reference this table
+                    if parent_column.lower() == 'id':
+                        for child_table, child_df in tables.items():
+                            if child_table == parent_table:
+                                continue
+                            
+                            # Look for columns like 'parent_table_id'
+                            expected_column = f"{parent_table.lower().rstrip('s')}_id"
+                            
+                            for child_column in child_df.columns:
+                                if child_column.lower() == expected_column:
+                                    relationships.append(Relationship(
+                                        parent_table=parent_table,
+                                        parent_column=parent_column,
+                                        child_table=child_table,
+                                        child_column=child_column,
+                                        confidence=0.9
+                                    ))
+                    
+                    # For 'xxx_id' columns, look for tables with 'id' column
+                    elif parent_column.lower().endswith('_id'):
+                        # Extract the referenced table name
+                        referenced_table = parent_column.lower()[:-3]
+                        
+                        # Handle common plural forms
+                        if referenced_table.endswith('s'):
+                            referenced_table_singular = referenced_table[:-1]
+                        else:
+                            referenced_table_singular = referenced_table
+                        
+                        # Look for matching tables
+                        for child_table, child_df in tables.items():
+                            if child_table.lower() == referenced_table or child_table.lower() == referenced_table_singular:
+                                if 'id' in child_df.columns:
+                                    relationships.append(Relationship(
+                                        parent_table=child_table,
+                                        parent_column='id',
+                                        child_table=parent_table,
+                                        child_column=parent_column,
+                                        confidence=0.9
+                                    ))
         
         return relationships
     
-    def _save_relationships(self, relationships: List[TableRelationship]) -> None:
-        """Save relationships to file.
+    def _discover_relationships_foreign_key_analysis(self, tables: Dict[str, pd.DataFrame]) -> List[Relationship]:
+        """Discover relationships using foreign key analysis.
+        
+        This method analyzes data patterns to identify potential foreign key relationships.
         
         Args:
-            relationships: List of TableRelationship instances.
+            tables: Dictionary mapping table names to DataFrames.
+        
+        Returns:
+            List of discovered relationships.
         """
-        # Convert to dictionaries
-        rel_dicts = [rel.to_dict() for rel in relationships]
+        self.logger.info("Discovering relationships using foreign key analysis")
         
-        # Save to file
-        output_file = os.path.join(self.output_dir, "relationships.json")
-        with open(output_file, 'w') as f:
-            json.dump(rel_dicts, f, indent=2)
+        relationships = []
         
-        self.logger.info(f"Relationships saved to {output_file}")
+        for parent_table, parent_df in tables.items():
+            # Identify potential primary key columns
+            potential_pk_columns = []
+            
+            for column in parent_df.columns:
+                # Check if column has unique values
+                if parent_df[column].nunique() == len(parent_df) and not parent_df[column].isna().any():
+                    potential_pk_columns.append(column)
+            
+            if not potential_pk_columns:
+                continue
+            
+            # For each potential primary key, look for matching foreign keys
+            for pk_column in potential_pk_columns:
+                pk_values = set(parent_df[pk_column])
+                
+                for child_table, child_df in tables.items():
+                    if child_table == parent_table:
+                        continue
+                    
+                    for child_column in child_df.columns:
+                        # Skip if column has all unique values (likely a primary key)
+                        if child_df[child_column].nunique() == len(child_df) and not child_df[child_column].isna().any():
+                            continue
+                        
+                        # Check if child column values are a subset of parent column values
+                        child_values = set(child_df[child_column].dropna())
+                        
+                        if not child_values:
+                            continue
+                        
+                        if child_values.issubset(pk_values):
+                            # Calculate confidence based on coverage
+                            coverage = len(child_values) / len(pk_values) if pk_values else 0
+                            confidence = min(0.8 + coverage * 0.2, 1.0)
+                            
+                            relationships.append(Relationship(
+                                parent_table=parent_table,
+                                parent_column=pk_column,
+                                child_table=child_table,
+                                child_column=child_column,
+                                confidence=confidence
+                            ))
+        
+        return relationships
+    
+    def _discover_relationships_data_profiling(self, tables: Dict[str, pd.DataFrame]) -> List[Relationship]:
+        """Discover relationships using data profiling.
+        
+        This method analyzes data distributions and patterns to identify potential relationships.
+        
+        Args:
+            tables: Dictionary mapping table names to DataFrames.
+        
+        Returns:
+            List of discovered relationships.
+        """
+        self.logger.info("Discovering relationships using data profiling")
+        
+        relationships = []
+        
+        # This is a simplified implementation
+        # A more comprehensive implementation would use statistical methods
+        # to analyze data distributions and patterns
+        
+        for parent_table, parent_df in tables.items():
+            for parent_column in parent_df.columns:
+                parent_values = parent_df[parent_column].dropna()
+                
+                # Skip columns with too many unique values (likely not a key)
+                if parent_values.nunique() > len(parent_df) * 0.9:
+                    continue
+                
+                for child_table, child_df in tables.items():
+                    if child_table == parent_table:
+                        continue
+                    
+                    for child_column in child_df.columns:
+                        child_values = child_df[child_column].dropna()
+                        
+                        # Skip columns with too many unique values (likely not a foreign key)
+                        if child_values.nunique() > len(child_df) * 0.9:
+                            continue
+                        
+                        # Check if data types are compatible
+                        if parent_values.dtype != child_values.dtype:
+                            continue
+                        
+                        # Check if there's significant overlap in values
+                        parent_set = set(parent_values)
+                        child_set = set(child_values)
+                        
+                        if not parent_set or not child_set:
+                            continue
+                        
+                        overlap = len(parent_set.intersection(child_set))
+                        
+                        if overlap > 0:
+                            # Calculate confidence based on overlap
+                            overlap_ratio = overlap / len(child_set)
+                            
+                            if overlap_ratio > 0.8:
+                                confidence = 0.7 + overlap_ratio * 0.3
+                                
+                                relationships.append(Relationship(
+                                    parent_table=parent_table,
+                                    parent_column=parent_column,
+                                    child_table=child_table,
+                                    child_column=child_column,
+                                    confidence=confidence
+                                ))
+        
+        return relationships
 
 
-class DomainPartitioner(Component):
-    """Component for partitioning data by business domain."""
+class DataPartitioner(Component):
+    """Component for partitioning data into domains."""
     
     def __init__(self, config_manager: ConfigManager):
-        """Initialize the domain partitioner.
+        """Initialize the data partitioner.
         
         Args:
             config_manager: Configuration manager instance.
         """
         super().__init__(config_manager)
-        self.output_dir = None
-        self.domain_config = None
+        self.method = None
+        self.max_partition_size_gb = None
     
     def initialize(self) -> None:
-        """Initialize the domain partitioner.
+        """Initialize the data partitioner.
         
         Raises:
-            ConfigurationError: If the partitioner cannot be initialized.
+            ConfigurationError: If the data partitioner cannot be initialized.
         """
-        # Create output directory
-        self.output_dir = os.path.join(
-            self.config_manager.get('general.output_directory', '/output/dwsf'),
-            'data_classification',
-            'domains'
-        )
-        os.makedirs(self.output_dir, exist_ok=True)
+        self.method = self.config_manager.get('data_classification.partitioning.method', 'domain_based')
+        self.max_partition_size_gb = self.config_manager.get('data_classification.partitioning.max_partition_size_gb', 10)
         
-        # Get domain configuration
-        self.domain_config = self.config_manager.get('data_classification.domain_partitioning', {})
-        
-        self.logger.info("Domain partitioner initialized")
+        self.logger.info(f"Data partitioner initialized with method: {self.method}")
     
-    def validate(self) -> bool:
-        """Validate the domain partitioner configuration and state.
+    def partition_data(self, tables: Dict[str, pd.DataFrame], domains: Dict[str, List[str]]) -> Dict[str, Dict[str, pd.DataFrame]]:
+        """Partition data into domains.
         
-        Returns:
-            True if the partitioner is valid, False otherwise.
-        
-        Raises:
-            ValidationError: If validation fails.
-        """
-        if not os.path.exists(self.output_dir):
-            raise ValidationError(f"Output directory does not exist: {self.output_dir}")
-        
-        if not self.domain_config:
-            raise ValidationError("Domain configuration is missing")
-        
-        return True
-    
-    def partition_by_domain(self, dfs: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, pd.DataFrame]]:
-        """Partition data by business domain.
+        This method organizes tables into domain-specific partitions
+        for more efficient processing in subsequent steps.
         
         Args:
-            dfs: Dictionary mapping table names to DataFrames.
+            tables: Dictionary mapping table names to DataFrames.
+            domains: Dictionary mapping domain names to lists of table names.
         
         Returns:
-            Dictionary mapping domain names to dictionaries of table DataFrames.
+            Dictionary mapping domain names to dictionaries mapping table names to DataFrames.
         """
-        self.logger.info(f"Partitioning {len(dfs)} tables by domain")
+        self.logger.info(f"Partitioning data using method: {self.method}")
         
-        # Get domain definitions
-        domains = self.domain_config.get('domains', [])
+        if self.method == 'domain_based':
+            return self._partition_data_domain_based(tables, domains)
+        elif self.method == 'size_based':
+            return self._partition_data_size_based(tables, domains)
+        elif self.method == 'hybrid':
+            return self._partition_data_hybrid(tables, domains)
+        else:
+            self.logger.warning(f"Unknown partitioning method: {self.method}, falling back to domain-based")
+            return self._partition_data_domain_based(tables, domains)
+    
+    def _partition_data_domain_based(self, tables: Dict[str, pd.DataFrame], domains: Dict[str, List[str]]) -> Dict[str, Dict[str, pd.DataFrame]]:
+        """Partition data based on domains.
         
-        if not domains:
-            self.logger.warning("No domain definitions found in configuration")
-            return {}
+        Args:
+            tables: Dictionary mapping table names to DataFrames.
+            domains: Dictionary mapping domain names to lists of table names.
         
-        # Create domain partitions
-        domain_partitions = []
-        for domain_def in domains:
-            domain = DomainPartition(
-                name=domain_def.get('name', ''),
-                tables=domain_def.get('tables', []),
-                description=domain_def.get('description'),
-                priority=domain_def.get('priority', 0)
-            )
-            domain_partitions.append(domain)
+        Returns:
+            Dictionary mapping domain names to dictionaries mapping table names to DataFrames.
+        """
+        self.logger.info("Partitioning data based on domains")
         
-        # Partition data by domain
-        result = {}
-        for domain in domain_partitions:
-            domain_dfs = {}
-            for table_name in domain.tables:
-                if table_name in dfs:
-                    domain_dfs[table_name] = dfs[table_name]
+        partitions = {}
+        
+        for domain, domain_tables in domains.items():
+            partition = {}
             
-            if domain_dfs:
-                result[domain.name] = domain_dfs
+            for table_name in domain_tables:
+                if table_name in tables:
+                    partition[table_name] = tables[table_name]
+            
+            if partition:
+                partitions[domain] = partition
         
-        # Save domain partitions
-        self._save_domain_partitions(domain_partitions)
-        
-        return result
+        return partitions
     
-    def _save_domain_partitions(self, domain_partitions: List[DomainPartition]) -> None:
-        """Save domain partitions to file.
+    def _partition_data_size_based(self, tables: Dict[str, pd.DataFrame], domains: Dict[str, List[str]]) -> Dict[str, Dict[str, pd.DataFrame]]:
+        """Partition data based on size.
         
         Args:
-            domain_partitions: List of DomainPartition instances.
+            tables: Dictionary mapping table names to DataFrames.
+            domains: Dictionary mapping domain names to lists of table names.
+        
+        Returns:
+            Dictionary mapping partition names to dictionaries mapping table names to DataFrames.
         """
-        # Convert to dictionaries
-        domain_dicts = [domain.to_dict() for domain in domain_partitions]
+        self.logger.info("Partitioning data based on size")
         
-        # Save to file
-        output_file = os.path.join(self.output_dir, "domains.json")
-        with open(output_file, 'w') as f:
-            json.dump(domain_dicts, f, indent=2)
+        # Calculate table sizes
+        table_sizes = {}
+        for table_name, df in tables.items():
+            # Estimate size in GB
+            size_gb = df.memory_usage(deep=True).sum() / (1024 ** 3)
+            table_sizes[table_name] = size_gb
         
-        self.logger.info(f"Domain partitions saved to {output_file}")
+        # Sort tables by size (largest first)
+        sorted_tables = sorted(table_sizes.items(), key=lambda x: x[1], reverse=True)
+        
+        # Create partitions
+        partitions = {}
+        current_partition = {}
+        current_partition_size = 0
+        partition_index = 0
+        
+        for table_name, size_gb in sorted_tables:
+            # If table is larger than max partition size, create a separate partition
+            if size_gb > self.max_partition_size_gb:
+                partitions[f"partition_{partition_index}"] = {table_name: tables[table_name]}
+                partition_index += 1
+                continue
+            
+            # If adding table would exceed max partition size, create a new partition
+            if current_partition_size + size_gb > self.max_partition_size_gb and current_partition:
+                partitions[f"partition_{partition_index}"] = current_partition
+                current_partition = {}
+                current_partition_size = 0
+                partition_index += 1
+            
+            # Add table to current partition
+            current_partition[table_name] = tables[table_name]
+            current_partition_size += size_gb
+        
+        # Add final partition if not empty
+        if current_partition:
+            partitions[f"partition_{partition_index}"] = current_partition
+        
+        return partitions
+    
+    def _partition_data_hybrid(self, tables: Dict[str, pd.DataFrame], domains: Dict[str, List[str]]) -> Dict[str, Dict[str, pd.DataFrame]]:
+        """Partition data using a hybrid approach.
+        
+        This method first partitions data by domain, then splits large domains
+        into smaller partitions based on size.
+        
+        Args:
+            tables: Dictionary mapping table names to DataFrames.
+            domains: Dictionary mapping domain names to lists of table names.
+        
+        Returns:
+            Dictionary mapping partition names to dictionaries mapping table names to DataFrames.
+        """
+        self.logger.info("Partitioning data using hybrid approach")
+        
+        # First, partition by domain
+        domain_partitions = self._partition_data_domain_based(tables, domains)
+        
+        # Then, split large domains
+        partitions = {}
+        
+        for domain, domain_tables in domain_partitions.items():
+            # Calculate domain size
+            domain_size_gb = sum(df.memory_usage(deep=True).sum() / (1024 ** 3) for df in domain_tables.values())
+            
+            # If domain is small enough, keep it as is
+            if domain_size_gb <= self.max_partition_size_gb:
+                partitions[domain] = domain_tables
+                continue
+            
+            # Otherwise, split domain based on size
+            table_sizes = {}
+            for table_name, df in domain_tables.items():
+                size_gb = df.memory_usage(deep=True).sum() / (1024 ** 3)
+                table_sizes[table_name] = size_gb
+            
+            # Sort tables by size (largest first)
+            sorted_tables = sorted(table_sizes.items(), key=lambda x: x[1], reverse=True)
+            
+            # Create partitions
+            current_partition = {}
+            current_partition_size = 0
+            partition_index = 0
+            
+            for table_name, size_gb in sorted_tables:
+                # If table is larger than max partition size, create a separate partition
+                if size_gb > self.max_partition_size_gb:
+                    partitions[f"{domain}_{partition_index}"] = {table_name: domain_tables[table_name]}
+                    partition_index += 1
+                    continue
+                
+                # If adding table would exceed max partition size, create a new partition
+                if current_partition_size + size_gb > self.max_partition_size_gb and current_partition:
+                    partitions[f"{domain}_{partition_index}"] = current_partition
+                    current_partition = {}
+                    current_partition_size = 0
+                    partition_index += 1
+                
+                # Add table to current partition
+                current_partition[table_name] = domain_tables[table_name]
+                current_partition_size += size_gb
+            
+            # Add final partition if not empty
+            if current_partition:
+                partitions[f"{domain}_{partition_index}"] = current_partition
+        
+        return partitions
 
 
 class DataClassificationPipeline(Pipeline):
@@ -639,273 +691,262 @@ class DataClassificationPipeline(Pipeline):
             config_manager: Configuration manager instance.
         """
         super().__init__(config_manager)
-        self.data_profiler = None
-        self.relationship_mapper = None
-        self.domain_partitioner = None
+        self.domain_detector = None
+        self.relationship_discoverer = None
+        self.data_partitioner = None
+        self.connector = None
     
     def initialize(self) -> None:
-        """Initialize the pipeline.
+        """Initialize the data classification pipeline.
         
         Raises:
             ConfigurationError: If the pipeline cannot be initialized.
         """
+        super().initialize()
+        
         # Initialize components
-        self.data_profiler = DataProfiler(self.config_manager)
-        self.data_profiler.initialize()
+        self.domain_detector = DomainDetector(self.config_manager)
+        self.domain_detector.initialize()
         
-        self.relationship_mapper = RelationshipMapper(self.config_manager)
-        self.relationship_mapper.initialize()
+        self.relationship_discoverer = RelationshipDiscoverer(self.config_manager)
+        self.relationship_discoverer.initialize()
         
-        self.domain_partitioner = DomainPartitioner(self.config_manager)
-        self.domain_partitioner.initialize()
+        self.data_partitioner = DataPartitioner(self.config_manager)
+        self.data_partitioner.initialize()
         
-        # Add pipeline steps
-        self.add_step(DataLoadingStep(self.config_manager))
-        self.add_step(DataProfilingStep(self.config_manager, self.data_profiler))
-        self.add_step(RelationshipMappingStep(self.config_manager, self.relationship_mapper))
-        self.add_step(DomainPartitioningStep(self.config_manager, self.domain_partitioner))
+        # Create data connector
+        self.connector = create_connector(self.config_manager)
+        
+        # Initialize steps
+        self.steps = [
+            PipelineStep(self.load_data),
+            PipelineStep(self.detect_domains),
+            PipelineStep(self.discover_relationships),
+            PipelineStep(self.partition_data),
+            PipelineStep(self.save_results)
+        ]
         
         self.logger.info("Data classification pipeline initialized")
     
-    def validate(self) -> bool:
-        """Validate the pipeline configuration and state.
-        
-        Returns:
-            True if the pipeline is valid, False otherwise.
-        
-        Raises:
-            ValidationError: If validation fails.
-        """
-        # Validate components
-        self.data_profiler.validate()
-        self.relationship_mapper.validate()
-        self.domain_partitioner.validate()
-        
-        return True
-
-
-class DataLoadingStep(PipelineStep):
-    """Pipeline step for loading data from sources."""
-    
-    def __init__(self, config_manager: ConfigManager):
-        """Initialize the data loading step.
+    def load_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Load data from the data source.
         
         Args:
-            config_manager: Configuration manager instance.
-        """
-        super().__init__(config_manager)
-        self.source_db_connector = None
-    
-    def execute(self, input_data: Any) -> Dict[str, pd.DataFrame]:
-        """Execute the data loading step.
-        
-        Args:
-            input_data: Input data from the previous step (not used).
+            data: Input data.
         
         Returns:
-            Dictionary mapping table names to DataFrames.
+            Updated data with loaded tables.
         
         Raises:
             ProcessingError: If data loading fails.
         """
-        self.logger.info("Loading data from sources")
+        self.logger.info("Loading data from data source")
         
-        # Create source database connector
         try:
-            self.source_db_connector = create_connector(self.config_manager, 'source_db')
-            self.source_db_connector.initialize()
-        except Exception as e:
-            raise ProcessingError(f"Failed to create source database connector: {str(e)}")
-        
-        # Get tables to load
-        domain_config = self.config_manager.get('data_classification.domain_partitioning', {})
-        domains = domain_config.get('domains', [])
-        
-        all_tables = []
-        for domain in domains:
-            all_tables.extend(domain.get('tables', []))
-        
-        # Remove duplicates
-        all_tables = list(set(all_tables))
-        
-        if not all_tables:
-            raise ProcessingError("No tables specified for loading")
-        
-        # Load data
-        result = {}
-        for table_name in all_tables:
-            try:
-                self.logger.info(f"Loading table {table_name}")
-                
-                # Get sample size for profiling
-                sample_size = self.config_manager.get('data_classification.profiling.sample_size', 0.1)
-                
-                # Build query with sampling
-                query = f"SELECT * FROM {table_name}"
-                if sample_size < 1.0:
-                    # Add sampling clause based on database type
-                    source_type = self.source_db_connector.source_config.type.lower()
-                    if source_type == 'postgresql':
-                        query += f" TABLESAMPLE SYSTEM ({sample_size * 100})"
-                    elif source_type == 'mysql':
-                        # MySQL doesn't have built-in sampling, use RAND()
-                        query += f" WHERE RAND() < {sample_size} LIMIT 100000"
-                    else:
-                        # Generic approach: add LIMIT
-                        query += f" LIMIT 100000"
-                
-                # Execute query
-                df = self.source_db_connector.execute_query(query)
-                
-                if df is not None and not df.empty:
-                    result[table_name] = df
-                    self.logger.info(f"Loaded {len(df)} rows from table {table_name}")
-                else:
-                    self.logger.warning(f"Table {table_name} is empty or could not be loaded")
-            except Exception as e:
-                self.logger.error(f"Error loading table {table_name}: {str(e)}")
-                # Continue with other tables
-        
-        if not result:
-            raise ProcessingError("No data could be loaded from any table")
-        
-        self.logger.info(f"Loaded {len(result)} tables")
-        return result
-
-
-class DataProfilingStep(PipelineStep):
-    """Pipeline step for profiling data."""
-    
-    def __init__(self, config_manager: ConfigManager, data_profiler: DataProfiler):
-        """Initialize the data profiling step.
-        
-        Args:
-            config_manager: Configuration manager instance.
-            data_profiler: DataProfiler instance.
-        """
-        super().__init__(config_manager)
-        self.data_profiler = data_profiler
-    
-    def execute(self, input_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-        """Execute the data profiling step.
-        
-        Args:
-            input_data: Dictionary mapping table names to DataFrames.
-        
-        Returns:
-            Input data (unchanged).
-        
-        Raises:
-            ProcessingError: If data profiling fails.
-        """
-        self.logger.info("Profiling data")
-        
-        if not input_data:
-            raise ProcessingError("No data to profile")
-        
-        # Check if profiling is enabled
-        if not self.config_manager.get('data_classification.profiling.enabled', True):
-            self.logger.info("Data profiling is disabled in configuration")
-            return input_data
-        
-        # Profile each table
-        for table_name, df in input_data.items():
-            try:
-                self.data_profiler.profile_table(df, table_name)
-            except Exception as e:
-                self.logger.error(f"Error profiling table {table_name}: {str(e)}")
-                # Continue with other tables
-        
-        return input_data
-
-
-class RelationshipMappingStep(PipelineStep):
-    """Pipeline step for mapping relationships between tables."""
-    
-    def __init__(self, config_manager: ConfigManager, relationship_mapper: RelationshipMapper):
-        """Initialize the relationship mapping step.
-        
-        Args:
-            config_manager: Configuration manager instance.
-            relationship_mapper: RelationshipMapper instance.
-        """
-        super().__init__(config_manager)
-        self.relationship_mapper = relationship_mapper
-    
-    def execute(self, input_data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
-        """Execute the relationship mapping step.
-        
-        Args:
-            input_data: Dictionary mapping table names to DataFrames.
-        
-        Returns:
-            Dictionary with input data and relationships.
-        
-        Raises:
-            ProcessingError: If relationship mapping fails.
-        """
-        self.logger.info("Mapping relationships between tables")
-        
-        if not input_data:
-            raise ProcessingError("No data to map relationships")
-        
-        # Check if relationship mapping is enabled
-        if not self.config_manager.get('data_classification.relationship_mapping.enabled', True):
-            self.logger.info("Relationship mapping is disabled in configuration")
-            return {'data': input_data, 'relationships': []}
-        
-        # Map relationships
-        try:
-            relationships = self.relationship_mapper.map_relationships(input_data)
-            return {'data': input_data, 'relationships': relationships}
-        except Exception as e:
-            self.logger.error(f"Error mapping relationships: {str(e)}")
-            return {'data': input_data, 'relationships': []}
-
-
-class DomainPartitioningStep(PipelineStep):
-    """Pipeline step for partitioning data by business domain."""
-    
-    def __init__(self, config_manager: ConfigManager, domain_partitioner: DomainPartitioner):
-        """Initialize the domain partitioning step.
-        
-        Args:
-            config_manager: Configuration manager instance.
-            domain_partitioner: DomainPartitioner instance.
-        """
-        super().__init__(config_manager)
-        self.domain_partitioner = domain_partitioner
-    
-    def execute(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute the domain partitioning step.
-        
-        Args:
-            input_data: Dictionary with data and relationships.
-        
-        Returns:
-            Dictionary with data, relationships, and domain partitions.
-        
-        Raises:
-            ProcessingError: If domain partitioning fails.
-        """
-        self.logger.info("Partitioning data by business domain")
-        
-        if not input_data or 'data' not in input_data:
-            raise ProcessingError("No data to partition")
-        
-        # Partition data by domain
-        try:
-            domain_partitions = self.domain_partitioner.partition_by_domain(input_data['data'])
+            # Connect to data source
+            self.connector.connect()
             
-            return {
-                'data': input_data['data'],
-                'relationships': input_data.get('relationships', []),
-                'domain_partitions': domain_partitions
-            }
+            # Get list of tables
+            table_list = self.connector.get_tables()
+            
+            # Filter tables based on configuration
+            include_tables = self.config_manager.get('data_sources.primary_warehouse.tables.include', [])
+            exclude_tables = self.config_manager.get('data_sources.primary_warehouse.tables.exclude', [])
+            
+            if include_tables:
+                table_list = [t for t in table_list if t in include_tables]
+            
+            if exclude_tables:
+                table_list = [t for t in table_list if t not in exclude_tables]
+            
+            # Load tables
+            tables = {}
+            for table_name in table_list:
+                self.logger.info(f"Loading table: {table_name}")
+                tables[table_name] = self.connector.get_table_data(table_name)
+            
+            # Disconnect from data source
+            self.connector.disconnect()
+            
+            # Update data
+            result = data.copy()
+            result['tables'] = tables
+            result['original_data'] = tables.copy()
+            
+            self.logger.info(f"Loaded {len(tables)} tables")
+            return result
         except Exception as e:
-            self.logger.error(f"Error partitioning data by domain: {str(e)}")
-            return {
-                'data': input_data['data'],
-                'relationships': input_data.get('relationships', []),
-                'domain_partitions': {}
+            self.logger.error(f"Error loading data: {str(e)}")
+            raise ProcessingError(f"Error loading data: {str(e)}")
+    
+    def detect_domains(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect domains in the data.
+        
+        Args:
+            data: Input data with loaded tables.
+        
+        Returns:
+            Updated data with detected domains.
+        
+        Raises:
+            ProcessingError: If domain detection fails.
+        """
+        self.logger.info("Detecting domains")
+        
+        try:
+            tables = data.get('tables', {})
+            
+            if not tables:
+                self.logger.warning("No tables found for domain detection")
+                return data
+            
+            # Detect domains
+            domains = self.domain_detector.detect_domains(tables)
+            
+            # Update data
+            result = data.copy()
+            result['domains'] = domains
+            
+            self.logger.info(f"Detected {len(domains)} domains")
+            return result
+        except Exception as e:
+            self.logger.error(f"Error detecting domains: {str(e)}")
+            raise ProcessingError(f"Error detecting domains: {str(e)}")
+    
+    def discover_relationships(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Discover relationships between tables.
+        
+        Args:
+            data: Input data with loaded tables and detected domains.
+        
+        Returns:
+            Updated data with discovered relationships.
+        
+        Raises:
+            ProcessingError: If relationship discovery fails.
+        """
+        self.logger.info("Discovering relationships")
+        
+        try:
+            tables = data.get('tables', {})
+            
+            if not tables:
+                self.logger.warning("No tables found for relationship discovery")
+                return data
+            
+            # Discover relationships
+            relationships = self.relationship_discoverer.discover_relationships(tables)
+            
+            # Update data
+            result = data.copy()
+            result['relationships'] = relationships
+            
+            self.logger.info(f"Discovered {len(relationships)} relationships")
+            return result
+        except Exception as e:
+            self.logger.error(f"Error discovering relationships: {str(e)}")
+            raise ProcessingError(f"Error discovering relationships: {str(e)}")
+    
+    def partition_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Partition data into domains.
+        
+        Args:
+            data: Input data with loaded tables, detected domains, and discovered relationships.
+        
+        Returns:
+            Updated data with partitioned data.
+        
+        Raises:
+            ProcessingError: If data partitioning fails.
+        """
+        self.logger.info("Partitioning data")
+        
+        try:
+            tables = data.get('tables', {})
+            domains = data.get('domains', {})
+            
+            if not tables:
+                self.logger.warning("No tables found for data partitioning")
+                return data
+            
+            if not domains:
+                self.logger.warning("No domains found for data partitioning")
+                return data
+            
+            # Partition data
+            domain_partitions = self.data_partitioner.partition_data(tables, domains)
+            
+            # Update data
+            result = data.copy()
+            result['domain_partitions'] = domain_partitions
+            
+            self.logger.info(f"Created {len(domain_partitions)} partitions")
+            return result
+        except Exception as e:
+            self.logger.error(f"Error partitioning data: {str(e)}")
+            raise ProcessingError(f"Error partitioning data: {str(e)}")
+    
+    def save_results(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Save classification results.
+        
+        Args:
+            data: Input data with all classification results.
+        
+        Returns:
+            Updated data with saved results.
+        
+        Raises:
+            ProcessingError: If saving results fails.
+        """
+        self.logger.info("Saving classification results")
+        
+        try:
+            # Create output directories
+            domains_dir = os.path.join(self.output_dir, 'domains')
+            relationships_dir = os.path.join(self.output_dir, 'relationships')
+            partitions_dir = os.path.join(self.output_dir, 'partitions')
+            
+            ensure_directory(domains_dir)
+            ensure_directory(relationships_dir)
+            ensure_directory(partitions_dir)
+            
+            # Save domains
+            domains = data.get('domains', {})
+            if domains:
+                domains_file = os.path.join(domains_dir, 'domains.json')
+                save_json(domains, domains_file)
+            
+            # Save relationships
+            relationships = data.get('relationships', [])
+            if relationships:
+                relationships_file = os.path.join(relationships_dir, 'relationships.json')
+                save_json([r.to_dict() for r in relationships], relationships_file)
+            
+            # Save partitions metadata
+            domain_partitions = data.get('domain_partitions', {})
+            if domain_partitions:
+                partitions_metadata = {}
+                
+                for domain, tables in domain_partitions.items():
+                    partitions_metadata[domain] = {
+                        'tables': list(tables.keys()),
+                        'row_counts': {table: len(df) for table, df in tables.items()},
+                        'column_counts': {table: len(df.columns) for table, df in tables.items()}
+                    }
+                
+                partitions_file = os.path.join(partitions_dir, 'partitions.json')
+                save_json(partitions_metadata, partitions_file)
+            
+            # Update data
+            result = data.copy()
+            result['classification_results'] = {
+                'domains_file': os.path.join(domains_dir, 'domains.json'),
+                'relationships_file': os.path.join(relationships_dir, 'relationships.json'),
+                'partitions_file': os.path.join(partitions_dir, 'partitions.json')
             }
+            
+            self.logger.info("Classification results saved")
+            return result
+        except Exception as e:
+            self.logger.error(f"Error saving classification results: {str(e)}")
+            raise ProcessingError(f"Error saving classification results: {str(e)}")
