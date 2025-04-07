@@ -1,0 +1,175 @@
+name: Data Warehouse Subsampling Framework
+version: 1.0.0
+description: A comprehensive solution for reducing data warehouse testing volumes while preserving anomalies and data relationships
+author: DWSF Team
+dependencies:
+  - python>=3.8
+  - pandas>=1.3.0
+  - numpy>=1.20.0
+  - scikit-learn>=1.0.0
+  - networkx>=2.6.0
+  - docker>=5.0.0
+  - pyyaml>=6.0
+  - matplotlib>=3.4.0
+  - sqlalchemy>=1.4.0
+  - pyarrow>=6.0.0  # For parquet support
+  - fastparquet>=0.8.0  # Alternative parquet engine
+  - psycopg2-binary>=2.9.0  # For PostgreSQL support
+  - pymysql>=1.0.0  # For MySQL support
+  - pytest>=6.0.0  # For testing
+
+output_directory: /output/dwsf
+
+general:
+  log_level: INFO
+  output_directory: /output/dwsf
+  temp_directory: /tmp/dwsf
+
+data_classification:
+  enabled: true
+  domain_detection:
+    method: "rule_based"  # Options: rule_based, clustering, manual
+    min_domain_size: 1
+    max_domain_size: 50
+  relationship_discovery:
+    enabled: true
+    methods:
+      - "name_matching"
+      - "foreign_key_analysis"
+      - "data_profiling"
+    min_confidence: 0.8
+  partitioning:
+    method: "domain_based"  # Options: domain_based, size_based, hybrid
+    max_partition_size_gb: 10
+
+anomaly_detection:
+  enabled: true
+  methods:
+    statistical:
+      enabled: true
+      z_score:
+        enabled: true
+        threshold: 3.0
+      iqr:
+        enabled: true
+        factor: 1.5
+    clustering:
+      enabled: true
+      algorithm: "dbscan"  # Options: dbscan, isolation_forest, lof
+      contamination: 0.01
+    rule_based:
+      enabled: true
+      rules_file: "anomaly_rules.yaml"
+  parallel:
+    enabled: true
+    max_workers: 4
+  storage:
+    format: "json"
+    include_context: true
+    context_depth: 2
+
+core_sampling:
+  enabled: true
+  methods:
+    stratified:
+      enabled: true
+      default_sample_size: 0.1
+      strata:
+        customer_transactions:
+          strata_columns: ["customer_type", "transaction_type"]
+          strata_sample_sizes:
+            default: 0.1
+            rare: 0.5
+    entity_based:
+      enabled: true
+      default_sample_size: 0.1
+      entities:
+        customer:
+          primary_entity_table: "customers"
+          entity_config:
+            id_column: "customer_id"
+            sample_size: 0.1
+          related_tables:
+            - table: "customer_addresses"
+              join_column: "customer_id"
+            - table: "customer_contacts"
+              join_column: "customer_id"
+    boundary_value:
+      enabled: true
+      config:
+        default:
+          min_max: true
+          percentiles: [5, 95]
+          outliers: true
+    anomaly_preservation:
+      enabled: true
+      default_sample_size: 0.1
+  method_selection:
+    method_mapping:
+      default: "stratified"
+      "domain:customer": "entity_based"
+      "domain:reference": "boundary_value"
+      "customers": "entity_based"
+      "transactions": "stratified"
+      "products": "boundary_value"
+  referential_integrity:
+    enabled: true
+
+data_integration:
+  enabled: true
+  referential_integrity:
+    enabled: true
+    max_depth: 3
+  anomaly_context:
+    enabled: true
+    context_depth: 2
+  purpose_specific:
+    enabled: true
+    purposes:
+      - name: "functional_testing"
+        domains: ["customer", "product"]
+        tables: []
+      - name: "performance_testing"
+        domains: ["transaction"]
+        tables:
+          - domain: "customer"
+            table: "customers"
+  export:
+    enabled: true
+    format: "csv"  # Options: csv, parquet, json
+
+test_env_provisioning:
+  enabled: true
+  docker:
+    enabled: false
+    image: "postgres:latest"
+    ports:
+      "5432/tcp": null
+    environment:
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "postgres"
+      POSTGRES_DB: "testdb"
+  file:
+    enabled: true
+    format: "csv"  # Options: csv, parquet, json
+  database:
+    enabled: true
+    db_type: "sqlite"
+  environments:
+    - name: "functional_test_env"
+      type: "file"
+      datasets: ["functional_testing"]
+    - name: "performance_test_env"
+      type: "file"
+      datasets: ["performance_testing"]
+
+orchestration:
+  parallel:
+    enabled: false
+    max_workers: 4
+  checkpointing:
+    enabled: true
+    interval: 600  # seconds
+  reporting:
+    enabled: true
+    formats: ["json", "html", "txt"]

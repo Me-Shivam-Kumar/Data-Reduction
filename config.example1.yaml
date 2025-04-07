@@ -1,0 +1,225 @@
+# Data Warehouse Subsampling Framework Configuration
+
+# General configuration
+general:
+  project_name: "Data Warehouse Subsampling"
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  temp_directory: "/tmp/dwsf"
+  output_directory: "/output/dwsf"
+  parallel_processes: 8  # Number of parallel processes to use
+
+# Data source configuration
+data_sources:
+  # Source database connections
+  source_db:
+    type: "postgresql"  # postgresql, mysql, oracle, sqlserver, etc.
+    host: "source-db-host"
+    port: 5432
+    database: "data_warehouse"
+    schema: "public"
+    user: "username"
+    password: "password"
+    ssl: false
+    
+  # HDFS configuration (if applicable)
+  hdfs:
+    namenode: "hdfs://namenode:8020"
+    user: "hdfs_user"
+    
+  # Spark configuration
+  spark:
+    master: "yarn"  # local[*], yarn, spark://host:port
+    app_name: "DataWarehouseSubsampling"
+    executor_memory: "4g"
+    executor_cores: 2
+    driver_memory: "2g"
+    max_result_size: "2g"
+    packages: []  # Additional packages to include
+
+# Data classification configuration
+data_classification:
+  enabled: true
+  profiling:
+    enabled: true
+    sample_size: 0.1  # 10% sample for profiling
+    statistics: ["count", "min", "max", "mean", "stddev", "nulls"]
+  
+  domain_partitioning:
+    domains:
+      - name: "customer"
+        tables: ["customers", "customer_addresses", "customer_preferences"]
+      - name: "product"
+        tables: ["products", "product_categories", "product_attributes"]
+      - name: "transaction"
+        tables: ["orders", "order_items", "payments", "shipments"]
+      - name: "reference"
+        tables: ["countries", "currencies", "tax_rates"]
+  
+  relationship_mapping:
+    enabled: true
+    max_depth: 3  # Maximum relationship depth to analyze
+
+# Anomaly detection configuration
+anomaly_detection:
+  enabled: true
+  methods:
+    statistical:
+      enabled: true
+      z_score_threshold: 3.0
+      iqr_factor: 1.5
+    pattern:
+      enabled: true
+      algorithms: ["isolation_forest", "one_class_svm", "local_outlier_factor"]
+    business_rules:
+      enabled: true
+      rules_file: "config/business_rules.json"
+    machine_learning:
+      enabled: true
+      model_path: "models/anomaly_detection"
+      training:
+        enabled: false  # Set to true to train models
+        train_size: 0.7
+  
+  anomaly_repository:
+    type: "mongodb"  # mongodb, postgresql, file
+    connection:
+      host: "mongodb-host"
+      port: 27017
+      database: "anomaly_repository"
+      collection: "anomalies"
+      user: "username"
+      password: "password"
+    
+    retention:
+      max_anomalies: 1000000  # Maximum number of anomalies to store
+      max_age_days: 90  # Maximum age of anomalies to keep
+
+# Core sampling configuration
+core_sampling:
+  enabled: true
+  techniques:
+    stratified_sampling:
+      enabled: true
+      domains: ["transaction"]
+      strata_columns: ["order_status", "payment_method", "customer_segment"]
+      sample_sizes:
+        default: 0.05  # 5% sample by default
+        special_cases:
+          high_value: 0.2  # 20% sample for high-value transactions
+          recent: 0.1  # 10% sample for recent transactions
+    
+    entity_based_subsetting:
+      enabled: true
+      domains: ["customer", "product"]
+      primary_entities:
+        customer:
+          table: "customers"
+          id_column: "customer_id"
+          sample_size: 0.1  # 10% of customers
+          selection_method: "stratified"  # random, stratified, systematic
+          strata_columns: ["customer_segment", "region"]
+        product:
+          table: "products"
+          id_column: "product_id"
+          sample_size: 0.15  # 15% of products
+          selection_method: "stratified"
+          strata_columns: ["category", "price_range"]
+    
+    boundary_value_extraction:
+      enabled: true
+      domains: ["reference", "product", "customer"]
+      methods:
+        min_max: true  # Include min and max values
+        percentiles: [1, 5, 95, 99]  # Include these percentiles
+        outliers: true  # Include outliers
+    
+    reference_data_preservation:
+      enabled: true
+      domains: ["reference"]
+      preservation_method: "complete"  # complete, filtered
+
+# Data integration configuration
+data_integration:
+  enabled: true
+  relationship_management:
+    referential_integrity: true
+    consistency_check: true
+    repair_strategy: "add_missing"  # add_missing, remove_orphans, ignore
+  
+  test_dataset_composition:
+    purpose_specific_datasets:
+      - name: "functional_testing"
+        description: "Dataset for functional testing"
+        anomaly_injection_rate: 0.1  # 10% anomalies
+        domains: ["customer", "product", "transaction", "reference"]
+      - name: "performance_testing"
+        description: "Dataset for performance testing"
+        anomaly_injection_rate: 0.05  # 5% anomalies
+        domains: ["transaction"]
+      - name: "regression_testing"
+        description: "Dataset for regression testing"
+        anomaly_injection_rate: 0.2  # 20% anomalies
+        domains: ["customer", "product", "transaction"]
+
+# Test environment provisioning configuration
+test_env_provisioning:
+  enabled: true
+  virtual_data_management:
+    method: "copy_on_write"  # copy_on_write, full_copy, symlink
+    compression: true
+    deduplication: true
+  
+  environment_orchestration:
+    container_engine: "docker"  # docker, kubernetes
+    kubernetes:
+      namespace: "test-environments"
+      storage_class: "standard"
+    docker:
+      network: "test-network"
+      volume_driver: "local"
+  
+  environments:
+    - name: "functional"
+      dataset: "functional_testing"
+      resources:
+        cpu: 2
+        memory: "4Gi"
+        storage: "500Gi"
+    - name: "performance"
+      dataset: "performance_testing"
+      resources:
+        cpu: 4
+        memory: "8Gi"
+        storage: "1Ti"
+    - name: "regression"
+      dataset: "regression_testing"
+      resources:
+        cpu: 2
+        memory: "4Gi"
+        storage: "500Gi"
+
+# Orchestration configuration
+orchestration:
+  engine: "airflow"  # airflow, custom
+  airflow:
+    dag_directory: "/opt/airflow/dags"
+    schedule_interval: "0 0 * * *"  # Daily at midnight
+    catchup: false
+    max_active_runs: 1
+  
+  monitoring:
+    enabled: true
+    metrics:
+      - name: "data_reduction_ratio"
+        description: "Ratio of original data size to reduced data size"
+      - name: "anomaly_preservation_rate"
+        description: "Percentage of anomalies preserved in the test dataset"
+      - name: "processing_time"
+        description: "Total processing time for the pipeline"
+    
+    alerting:
+      enabled: true
+      thresholds:
+        data_reduction_ratio: 10  # Alert if reduction ratio is less than 10x
+        anomaly_preservation_rate: 95  # Alert if less than 95% of anomalies are preserved
+        processing_time: 7200  # Alert if processing takes more than 2 hours
